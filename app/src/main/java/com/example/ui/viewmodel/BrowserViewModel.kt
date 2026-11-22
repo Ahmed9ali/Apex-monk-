@@ -9,6 +9,12 @@ import android.webkit.WebView
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.example.devtools.ConsoleLogLevel
+import com.example.devtools.DevToolsCoordinator
+import com.example.devtools.DevToolsDockMode
+import com.example.devtools.DevToolsScripts
+import com.example.devtools.DevToolsTab
+import com.example.devtools.DevToolsUiState
 import com.example.automation.ActiveDomElementHighlight
 import com.example.automation.ActiveRecordingSession
 import com.example.automation.AgentRole
@@ -334,7 +340,8 @@ data class BrowserUiState(
     val activeDomHighlight: ActiveDomElementHighlight? = null,
     val isScannerOutlineOverlayEnabled: Boolean = true,
     val vaultExhaustionPromptState: VaultExhaustionPromptState? = null,
-    val initialAutomationVaultFolderId: String? = null
+    val initialAutomationVaultFolderId: String? = null,
+    val devTools: DevToolsUiState = DevToolsUiState()
 ) {
     val isSubscriptionDialogOpen: Boolean
         get() = isSyncBackupDialogOpen
@@ -632,7 +639,8 @@ class BrowserViewModel(
         val sampleCategory: String
     )
 
-    private val webViewRegistry = mutableMapOf<String, WebView>()
+    internal val webViewRegistry = mutableMapOf<String, WebView>()
+    private val devToolsCoordinator = DevToolsCoordinator()
     private val lastRecordedVisitByTab = mutableMapOf<String, RecordedTabVisit>()
     private val lastProgressUpdateAtByTab = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val pendingBlockedByTab = java.util.concurrent.ConcurrentHashMap<String, PendingBlockedBatch>()
@@ -650,8 +658,28 @@ class BrowserViewModel(
     @Volatile
     private var activeExecutionSessionId: String = ""
     private var recordingLifecycleJob: Job? = null
+    private val recordedSequenceCounter = java.util.concurrent.atomic.AtomicLong(0L)
     internal var lastRecordingRejectionCode: AutomationErrorCode = AutomationErrorCode.NONE
         private set
+
+    fun buildMultiFrameBridgeScript(): String = automationEngine.buildMultiFrameDocumentStartScript()
+
+    fun allocateRecordingSequence(sessionId: String): Long {
+        val current = _uiState.value.recordingSession
+        if (sessionId.isBlank() ||
+            current.status != RecordingStatus.RECORDING ||
+            current.sessionId != sessionId
+        ) {
+            return 0L
+        }
+        while (true) {
+            val prev = recordedSequenceCounter.get()
+            val next = maxOf(prev, current.lastSequenceNumber) + 1L
+            if (recordedSequenceCounter.compareAndSet(prev, next)) {
+                return next
+            }
+        }
+    }
     private val pageInspectionByTab = mutableMapOf<String, PageInspectionState>()
     private val pageScanJobByTab = mutableMapOf<String, Job>()
     private var pendingDestructiveInstructionConfirm: Boolean = false
@@ -703,6 +731,7 @@ class BrowserViewModel(
         val previous = webViewRegistry.put(tabId, webView)
         if (previous != null && previous !== webView) {
             runCatching { previous.removeJavascriptInterface("ApexAutomationBridge") }
+            runCatching { previous.removeJavascriptInterface("ApexDevToolsBridge") }
             runCatching { previous.removeJavascriptInterface("ApexPasswordBridge") }
             val session = _uiState.value.recordingSession
             if (session.initiatingTabId == tabId) {
@@ -728,6 +757,14 @@ class BrowserViewModel(
     }
 
     fun getWebView(tabId: String): WebView? = webViewRegistry[tabId]
+    fun unregisterWebView(tabId: String) {
+        val previous = webViewRegistry.remove(tabId)
+        if (previous != null) {
+            runCatching { previous.removeJavascriptInterface("ApexAutomationBridge") }
+            runCatching { previous.removeJavascriptInterface("ApexDevToolsBridge") }
+            runCatching { previous.removeJavascriptInterface("ApexPasswordBridge") }
+        }
+    }
 
     fun onWebViewPageLoadFailed(tabId: String, failingUrl: String) {
         onWebViewPageLoadFailedWithReason(tabId, failingUrl, "Page failed to load")
@@ -1364,6 +1401,9 @@ class BrowserViewModel(
                 _uiState.update { it.copy(preloadCandidates = candidates) }
             }
         }
+        if (tabId == _uiState.value.activeTabId && _uiState.value.devTools.isOpen) {
+            refreshDevToolsActiveTabData()
+        }
 
         // Record browsing history for non-private tabs (deduplicated across multiple WebView onPageFinished callbacks)
         if (finishedTab != null &&
@@ -1580,6 +1620,9 @@ class BrowserViewModel(
                 isSearchScreenOpen = false,
                 isToolbarVisible = true,
                 isBottomBarVisible = true,
+                devTools = state.devTools.copy(
+                    activeTabState = devToolsCoordinator.getTabState(tabId)
+                ),
                 pageInspection = pageInspectionByTab[tabId] ?: if (targetTab.isHomePage) {
                     PageInspectionState(tabId = tabId)
                 } else {
@@ -1590,6 +1633,9 @@ class BrowserViewModel(
                     )
                 }
             )
+        }
+        if (_uiState.value.devTools.isOpen && !_uiState.value.activeTab.isHomePage) {
+            refreshDevToolsActiveTabData()
         }
         refreshMatchedCredentialsForActiveTab()
         val selectedTab = _uiState.value.activeTab
@@ -1742,6 +1788,7 @@ class BrowserViewModel(
             navigationSynchronizer.onTabClosed(id)
             pageScanJobByTab.remove(id)?.cancel()
             pageInspectionByTab.remove(id)
+            devToolsCoordinator.clearTab(id)
             automationEngine.universalScanner.invalidateTabSession(id, DomScanStatus.SESSION_INVALIDATED, "Tab closed.", webViewRegistry[id])
             webViewRegistry.remove(id)?.let { wv ->
                 destroyWebViewSafely(wv, isIncognito = true)
@@ -1792,6 +1839,7 @@ class BrowserViewModel(
             navigationSynchronizer.onTabClosed(tab.id)
             pageScanJobByTab.remove(tab.id)?.cancel()
             pageInspectionByTab.remove(tab.id)
+            devToolsCoordinator.clearTab(tab.id)
             automationEngine.universalScanner.invalidateTabSession(tab.id, DomScanStatus.SESSION_INVALIDATED, "Tab closed.", webViewRegistry[tab.id])
             webViewRegistry.remove(tab.id)?.let { wv ->
                 destroyWebViewSafely(wv, isIncognito = tab.isPrivate)
@@ -2260,6 +2308,7 @@ class BrowserViewModel(
         navigationSynchronizer.onTabClosed(tabId)
         pageScanJobByTab.remove(tabId)?.cancel()
         pageInspectionByTab.remove(tabId)
+        devToolsCoordinator.clearTab(tabId)
         automationEngine.universalScanner.invalidateTabSession(tabId, DomScanStatus.SESSION_INVALIDATED, "Tab closed.", webViewRegistry[tabId])
         webViewRegistry.remove(tabId)?.let { wv ->
             destroyWebViewSafely(wv, isIncognito = closingTab.isPrivate)
@@ -2449,6 +2498,7 @@ class BrowserViewModel(
         pageScanJobByTab.values.forEach { it.cancel() }
         pageScanJobByTab.clear()
         pageInspectionByTab.clear()
+        devToolsCoordinator.clearAll()
         webViewRegistry.values.forEach { destroyWebViewSafely(it, isIncognito = false) }
         webViewRegistry.clear()
         lastRecordedVisitByTab.clear()
@@ -4542,6 +4592,9 @@ class BrowserViewModel(
                 return
             }
         }
+        val rememberedStartUrl = liveWebViewUrl
+            ?.takeIf { !it.equals("about:blank", ignoreCase = true) && !it.startsWith("data:", ignoreCase = true) }
+            ?: tabUrl
 
         val existing = stateSnapshot.recordingSession
         if (existing.initiatingTabId.isNotBlank() && existing.sessionId.isNotBlank()) {
@@ -4551,6 +4604,7 @@ class BrowserViewModel(
         val newSessionId = "rec_sess_${UUID.randomUUID()}"
         val expectedOrigin = parsedOrigin.canonicalOrigin
         recordedSecretsByStepId.clear()
+        recordedSequenceCounter.set(0L)
 
         _uiState.update {
             it.copy(
@@ -4565,7 +4619,7 @@ class BrowserViewModel(
                     status = RecordingStatus.IDLE,
                     steps = emptyList(),
                     targetDomain = domain,
-                    targetUrl = tabUrl,
+                    targetUrl = rememberedStartUrl,
                     suggestedName = if (domain == "Start Page") "Recorded Workflow" else "$domain Workflow",
                     recordingError = null,
                     pendingOriginChangeUrl = null
@@ -4585,7 +4639,7 @@ class BrowserViewModel(
             val latestTab = _uiState.value.tabs.firstOrNull { it.id == tabId }
             val latestOrigin = latestTab?.let { automationEngine.parseOrigin(it.url) }
             val latestWvUrl = wv.url?.trim()?.takeIf { it.isNotBlank() }?.let {
-                if (it.startsWith("data:", ignoreCase = true)) it else mapBaseUrlBackToScheme(it, latestTab?.url ?: tabUrl)
+                if (it.startsWith("data:", ignoreCase = true)) it else mapBaseUrlBackToScheme(it, latestTab?.url ?: rememberedStartUrl)
             }
             val latestWvOriginOk = latestWvUrl == null ||
                 (automationEngine.parseOrigin(latestWvUrl) as? RecordingOriginResult.Valid)?.canonicalOrigin == expectedOrigin
@@ -4613,7 +4667,7 @@ class BrowserViewModel(
                 setRecordingErrorState(
                     initiatingTabId = tabId,
                     targetDomain = domain,
-                    targetUrl = tabUrl,
+                    targetUrl = rememberedStartUrl,
                     code = errCode,
                     message = errMsg,
                     preserveSteps = false
@@ -4633,7 +4687,7 @@ class BrowserViewModel(
                         status = RecordingStatus.RECORDING,
                         steps = emptyList(),
                         targetDomain = domain,
-                        targetUrl = tabUrl,
+                        targetUrl = rememberedStartUrl,
                         suggestedName = if (domain == "Start Page") "Recorded Workflow" else "$domain Workflow",
                         startedAt = System.currentTimeMillis(),
                         lastSequenceNumber = 0L,
@@ -4776,6 +4830,7 @@ class BrowserViewModel(
         val resumeSessionId = session.sessionId
         val resumeTabId = session.initiatingTabId
         val resumeSeq = session.lastSequenceNumber
+        recordedSequenceCounter.set(resumeSeq)
 
         recordingLifecycleJob = viewModelScope.launch {
             val result = automationEngine.installRecorderScript(
@@ -4996,8 +5051,11 @@ class BrowserViewModel(
             )
         }
         val eventOrigin = automationEngine.parseOrigin(event.origin)
+        val isAllowedSubframeOrigin = event.isSubframe &&
+            eventOrigin is RecordingOriginResult.Valid &&
+            automationEngine.areSameSiteOrigins(eventOrigin.canonicalOrigin, expectedOrigin.canonicalOrigin)
         if (eventOrigin !is RecordingOriginResult.Valid ||
-            eventOrigin.canonicalOrigin != expectedOrigin.canonicalOrigin
+            (eventOrigin.canonicalOrigin != expectedOrigin.canonicalOrigin && !isAllowedSubframeOrigin)
         ) {
             return reject(
                 AutomationErrorCode.RECORDING_ORIGIN_CHANGED,
@@ -5169,7 +5227,8 @@ class BrowserViewModel(
                     matchedActionType == AutomationActionType.SELECT) &&
                     !requiresCred &&
                     cleanValue.isEmpty() &&
-                    ephemeralSecret.isEmpty()
+                    ephemeralSecret.isEmpty() &&
+                    detectedFieldCategory != AutomationVaultCategory.CUSTOM
 
                 val updatedSteps = when {
                     isDuplicateFocusStep -> current.steps
@@ -5307,6 +5366,9 @@ class BrowserViewModel(
                 recordedSecretsByStepId.remove(createdStep!!.id)
             }
         }
+        if (accepted) {
+            recordedSequenceCounter.updateAndGet { prev -> maxOf(prev, event.sequenceNumber) }
+        }
         if (accepted && !isPageLevelScroll && webViewRegistry[session.initiatingTabId] != null) {
             val mayOpenPopupOrSheet = matchedElement == null ||
                 (matchedActionType in setOf(AutomationActionType.CLICK, AutomationActionType.SELECT) && (
@@ -5327,6 +5389,18 @@ class BrowserViewModel(
                     ))
             if (mayOpenPopupOrSheet) {
                 scanActivePageElements(silent = true)
+            }
+            if (matchedActionType == AutomationActionType.CLICK ||
+                matchedActionType == AutomationActionType.SUBMIT ||
+                matchedActionType == AutomationActionType.KEY_PRESS
+            ) {
+                viewModelScope.launch {
+                    delay(300L)
+                    val curRec = _uiState.value.recordingSession
+                    if (curRec.status == RecordingStatus.RECORDING && curRec.sessionId == event.sessionId) {
+                        scanActivePageElements(silent = true)
+                    }
+                }
             }
         }
         return if (accepted) {
@@ -9338,6 +9412,7 @@ class BrowserViewModel(
                 wv.stopLoading()
             }
             runCatching { wv.removeJavascriptInterface("ApexAutomationBridge") }
+            runCatching { wv.removeJavascriptInterface("ApexDevToolsBridge") }
             runCatching { wv.removeJavascriptInterface("ApexPasswordBridge") }
             wv.webChromeClient = null
             wv.setDownloadListener(null)
@@ -9372,6 +9447,7 @@ class BrowserViewModel(
         pageScanJobByTab.values.forEach { it.cancel() }
         pageScanJobByTab.clear()
         pageInspectionByTab.clear()
+        devToolsCoordinator.clearAll()
         pendingBlockedByTab.clear()
         lastProgressUpdateAtByTab.clear()
         recordedSecretsByStepId.clear()
@@ -9395,6 +9471,369 @@ class BrowserViewModel(
         if (hadIncognito) {
             performanceOptimizer.wipeIncognitoSessionStorage()
         }
+    }
+
+    // --- Laptop-Style Developer Tools ---
+
+    private fun syncDevToolsActiveTabState(tabId: String, updatedTabState: com.example.devtools.DevToolsTabState) {
+        if (tabId != _uiState.value.activeTabId) return
+        _uiState.update { state ->
+            state.copy(
+                devTools = state.devTools.copy(activeTabState = updatedTabState)
+            )
+        }
+    }
+
+    fun openDevTools(
+        initialTab: DevToolsTab? = null,
+        isWideScreen: Boolean = false
+    ) {
+        val activeTabId = _uiState.value.activeTabId
+        val preferredDock = if (isWideScreen) {
+            DevToolsDockMode.SIDE_RIGHT
+        } else {
+            DevToolsDockMode.COMPACT_BOTTOM
+        }
+        val tabState = devToolsCoordinator.getTabState(activeTabId)
+        _uiState.update { state ->
+            state.copy(
+                isMenuSheetOpen = false,
+                isFindInPageOpen = false,
+                isToolbarVisible = true,
+                isBottomBarVisible = true,
+                devTools = state.devTools.copy(
+                    isOpen = true,
+                    activeTab = initialTab ?: state.devTools.activeTab,
+                    dockMode = if (!state.devTools.isOpen) preferredDock else state.devTools.dockMode,
+                    activeTabState = tabState
+                )
+            )
+        }
+        refreshDevToolsActiveTabData()
+    }
+
+    fun closeDevTools() {
+        val activeTabId = _uiState.value.activeTabId
+        val wv = webViewRegistry[activeTabId]
+        wv?.evaluateJavascript(DevToolsScripts.buildClearHighlightScript(), null)
+        wv?.evaluateJavascript(DevToolsScripts.buildTapToInspectModeScript(false), null)
+        val tabState = devToolsCoordinator.setInspectElementMode(activeTabId, false)
+        _uiState.update { state ->
+            state.copy(
+                devTools = state.devTools.copy(
+                    isOpen = false,
+                    activeTabState = tabState
+                )
+            )
+        }
+    }
+
+    fun toggleDevTools(isWideScreen: Boolean = false) {
+        if (_uiState.value.devTools.isOpen) {
+            closeDevTools()
+        } else {
+            openDevTools(isWideScreen = isWideScreen)
+        }
+    }
+
+    fun selectDevToolsTab(tab: DevToolsTab) {
+        _uiState.update { state ->
+            state.copy(devTools = state.devTools.copy(activeTab = tab))
+        }
+        refreshDevToolsActiveTabData()
+    }
+
+    fun cycleDevToolsDockMode(isWideScreen: Boolean) {
+        _uiState.update { state ->
+            val current = state.devTools.dockMode
+            val next = if (isWideScreen) {
+                when (current) {
+                    DevToolsDockMode.SIDE_RIGHT -> DevToolsDockMode.COMPACT_BOTTOM
+                    DevToolsDockMode.COMPACT_BOTTOM -> DevToolsDockMode.EXPANDED
+                    DevToolsDockMode.EXPANDED -> DevToolsDockMode.SIDE_RIGHT
+                }
+            } else {
+                when (current) {
+                    DevToolsDockMode.COMPACT_BOTTOM -> DevToolsDockMode.EXPANDED
+                    else -> DevToolsDockMode.COMPACT_BOTTOM
+                }
+            }
+            state.copy(devTools = state.devTools.copy(dockMode = next))
+        }
+    }
+
+    fun refreshDevToolsActiveTabData() {
+        val state = _uiState.value
+        if (state.activeTab.isHomePage) return
+        when (state.devTools.activeTab) {
+            DevToolsTab.CONSOLE -> syncDevToolsNetworkPerformance()
+            DevToolsTab.ELEMENTS -> refreshDevToolsDom()
+            DevToolsTab.NETWORK -> syncDevToolsNetworkPerformance()
+            DevToolsTab.APPLICATION -> refreshDevToolsStorage()
+        }
+    }
+
+    fun updateDevToolsConsoleInput(input: String) {
+        _uiState.update { state ->
+            state.copy(devTools = state.devTools.copy(consoleInput = input))
+        }
+    }
+
+    fun evaluateDevToolsConsole(expression: String) {
+        val trimmed = expression.trim()
+        if (trimmed.isEmpty()) return
+        val tabId = _uiState.value.activeTabId
+        val wv = webViewRegistry[tabId]
+        _uiState.update { state ->
+            state.copy(
+                devTools = state.devTools.copy(
+                    consoleInput = "",
+                    isEvaluatingJs = wv != null
+                )
+            )
+        }
+        devToolsCoordinator.evaluateConsoleExpression(wv, tabId, trimmed) { updated ->
+            _uiState.update { state ->
+                state.copy(
+                    devTools = state.devTools.copy(
+                        isEvaluatingJs = false,
+                        activeTabState = if (state.activeTabId == tabId) updated else state.devTools.activeTabState
+                    )
+                )
+            }
+        }
+    }
+
+    fun setDevToolsConsoleFilter(level: ConsoleLogLevel?) {
+        val tabId = _uiState.value.activeTabId
+        val updated = devToolsCoordinator.setConsoleFilter(tabId, level)
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun clearDevToolsConsole() {
+        val tabId = _uiState.value.activeTabId
+        val updated = devToolsCoordinator.clearConsole(tabId)
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun onDevToolsConsoleMessage(
+        tabId: String,
+        level: ConsoleLogLevel,
+        message: String,
+        source: String,
+        lineNumber: Int
+    ) {
+        val updated = devToolsCoordinator.appendConsoleEntry(
+            tabId = tabId,
+            level = level,
+            message = message,
+            source = source,
+            lineNumber = lineNumber
+        )
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun onDevToolsNetworkRequest(
+        tabId: String,
+        url: String,
+        method: String,
+        resourceType: String,
+        statusLabel: String,
+        isBlocked: Boolean,
+        isError: Boolean
+    ) {
+        val updated = devToolsCoordinator.recordNetworkRequest(
+            tabId = tabId,
+            url = url,
+            method = method,
+            resourceType = resourceType,
+            statusLabel = statusLabel,
+            isBlocked = isBlocked,
+            isError = isError
+        )
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun onDevToolsNetworkError(tabId: String, url: String, statusLabel: String) {
+        val updated = devToolsCoordinator.markNetworkError(tabId, url, statusLabel)
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun setDevToolsNetworkSearch(query: String) {
+        val tabId = _uiState.value.activeTabId
+        val current = devToolsCoordinator.getTabState(tabId)
+        val updated = devToolsCoordinator.setNetworkFilter(tabId, query, current.networkOnlyFlagged)
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun toggleDevToolsNetworkFlaggedOnly() {
+        val tabId = _uiState.value.activeTabId
+        val current = devToolsCoordinator.getTabState(tabId)
+        val updated = devToolsCoordinator.setNetworkFilter(
+            tabId,
+            current.networkSearchQuery,
+            !current.networkOnlyFlagged
+        )
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun clearDevToolsNetwork() {
+        val tabId = _uiState.value.activeTabId
+        val updated = devToolsCoordinator.clearNetwork(tabId)
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun syncDevToolsNetworkPerformance() {
+        val tabId = _uiState.value.activeTabId
+        val wv = webViewRegistry[tabId] ?: return
+        wv.evaluateJavascript(DevToolsScripts.buildPerformanceResourcesScript()) { raw ->
+            val resources = DevToolsScripts.parsePerformanceResources(raw)
+            val updated = devToolsCoordinator.mergePerformanceResources(tabId, resources)
+            syncDevToolsActiveTabState(tabId, updated)
+        }
+    }
+
+    fun setDevToolsDomSearch(query: String) {
+        val tabId = _uiState.value.activeTabId
+        val updated = devToolsCoordinator.setDomSearchQuery(tabId, query)
+        syncDevToolsActiveTabState(tabId, updated)
+    }
+
+    fun refreshDevToolsDom() {
+        val active = _uiState.value.activeTab
+        if (active.isHomePage) return
+        val tabId = active.id
+        val wv = webViewRegistry[tabId] ?: return
+        val query = devToolsCoordinator.getTabState(tabId).domSearchQuery
+        val loadingState = devToolsCoordinator.setDomLoading(tabId, true)
+        syncDevToolsActiveTabState(tabId, loadingState)
+        wv.evaluateJavascript(DevToolsScripts.buildDomTreeSnapshotScript(query)) { raw ->
+            val nodes = DevToolsScripts.parseDomNodesResponse(raw)
+            val updated = devToolsCoordinator.setDomNodes(tabId, nodes)
+            syncDevToolsActiveTabState(tabId, updated)
+        }
+    }
+
+    fun selectDevToolsDomNode(selector: String) {
+        val tabId = _uiState.value.activeTabId
+        val updated = devToolsCoordinator.selectDomNode(tabId, selector)
+        syncDevToolsActiveTabState(tabId, updated)
+        val wv = webViewRegistry[tabId] ?: return
+        wv.evaluateJavascript(DevToolsScripts.buildHighlightAndInspectSelectorScript(selector), null)
+    }
+
+    fun toggleDevToolsInspectElementMode() {
+        val active = _uiState.value.activeTab
+        if (active.isHomePage) return
+        val tabId = active.id
+        val current = devToolsCoordinator.getTabState(tabId)
+        val nextEnabled = !current.isInspectElementMode
+        val updated = devToolsCoordinator.setInspectElementMode(tabId, nextEnabled)
+        syncDevToolsActiveTabState(tabId, updated)
+        webViewRegistry[tabId]?.evaluateJavascript(
+            DevToolsScripts.buildTapToInspectModeScript(nextEnabled),
+            null
+        )
+    }
+
+    fun onDevToolsElementPicked(tabId: String, selector: String) {
+        val updated = devToolsCoordinator.selectDomNode(tabId, selector)
+        _uiState.update { state ->
+            state.copy(
+                devTools = state.devTools.copy(
+                    isOpen = true,
+                    activeTab = DevToolsTab.ELEMENTS,
+                    activeTabState = if (state.activeTabId == tabId) updated else state.devTools.activeTabState
+                )
+            )
+        }
+        val wv = webViewRegistry[tabId] ?: return
+        wv.evaluateJavascript(DevToolsScripts.buildHighlightAndInspectSelectorScript(selector), null)
+        wv.evaluateJavascript(DevToolsScripts.buildDomTreeSnapshotScript(selector)) { raw ->
+            val nodes = DevToolsScripts.parseDomNodesResponse(raw)
+            if (nodes.isNotEmpty()) {
+                val merged = devToolsCoordinator.setDomNodes(tabId, nodes)
+                val selected = devToolsCoordinator.selectDomNode(tabId, nodes.first().selector)
+                syncDevToolsActiveTabState(tabId, selected.copy(domNodes = merged.domNodes))
+            }
+        }
+    }
+
+    fun toggleDevToolsLayoutOutlines() {
+        val active = _uiState.value.activeTab
+        if (active.isHomePage) return
+        val tabId = active.id
+        val current = devToolsCoordinator.getTabState(tabId)
+        val next = !current.isLayoutOutlinesEnabled
+        val updated = devToolsCoordinator.setLayoutOutlinesEnabled(tabId, next)
+        syncDevToolsActiveTabState(tabId, updated)
+        webViewRegistry[tabId]?.evaluateJavascript(
+            DevToolsScripts.buildToggleLayoutOutlinesScript(next),
+            null
+        )
+    }
+
+    fun refreshDevToolsStorage() {
+        val active = _uiState.value.activeTab
+        if (active.isHomePage) return
+        val tabId = active.id
+        val wv = webViewRegistry[tabId] ?: return
+        val loadingState = devToolsCoordinator.setStorageLoading(tabId, true)
+        syncDevToolsActiveTabState(tabId, loadingState)
+        val cookieHeader = devToolsCoordinator.readCookiesSafely(active.url)
+        val desktopMode = preferencesState.value.desktopViewportEnabled
+        wv.evaluateJavascript(DevToolsScripts.buildStorageSnapshotScript()) { raw ->
+            val updated = devToolsCoordinator.updateStorageSnapshot(
+                tabId = tabId,
+                pageUrl = active.url,
+                isDesktopMode = desktopMode,
+                rawJson = raw,
+                cookieHeader = cookieHeader
+            )
+            syncDevToolsActiveTabState(tabId, updated)
+        }
+    }
+
+    fun setDevToolsStorageItem(isSession: Boolean, key: String, value: String) {
+        val tabId = _uiState.value.activeTabId
+        val wv = webViewRegistry[tabId] ?: return
+        wv.evaluateJavascript(DevToolsScripts.buildSetStorageItemScript(isSession, key, value)) {
+            refreshDevToolsStorage()
+        }
+    }
+
+    fun deleteDevToolsStorageItem(isSession: Boolean, key: String) {
+        val tabId = _uiState.value.activeTabId
+        val wv = webViewRegistry[tabId] ?: return
+        wv.evaluateJavascript(DevToolsScripts.buildRemoveStorageItemScript(isSession, key)) {
+            refreshDevToolsStorage()
+        }
+    }
+
+    fun clearDevToolsStorage(scope: String) {
+        val tabId = _uiState.value.activeTabId
+        val wv = webViewRegistry[tabId] ?: return
+        wv.evaluateJavascript(DevToolsScripts.buildClearStorageScript(scope)) {
+            refreshDevToolsStorage()
+        }
+    }
+
+    fun clearDevToolsCookies() {
+        runCatching {
+            val cm = CookieManager.getInstance()
+            cm.removeAllCookies {
+                cm.flush()
+                refreshDevToolsStorage()
+            }
+        }
+    }
+
+    fun hardReloadActiveTab() {
+        val active = _uiState.value.activeTab
+        if (active.isHomePage) return
+        val wv = webViewRegistry[active.id] ?: return
+        wv.clearCache(false)
+        wv.reload()
     }
 
     companion object {

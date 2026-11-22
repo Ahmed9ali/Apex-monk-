@@ -86,6 +86,51 @@ object UniversalActionScripts {
                     return window;
                 }
             }
+            function apexCanonOriginFromUrl(rawUrl, baseHref) {
+                try {
+                    if (!rawUrl) return '';
+                    const u = new URL(String(rawUrl), baseHref || window.location.href);
+                    const proto = String(u.protocol || '').toLowerCase();
+                    if (proto !== 'http:' && proto !== 'https:') return '';
+                    const scheme = proto.slice(0, -1);
+                    const host = String(u.hostname || '').trim().replace(/\.+$/, '').toLowerCase();
+                    if (!host) return '';
+                    const port = u.port ? parseInt(u.port, 10) : (scheme === 'http' ? 80 : 443);
+                    if (!port || isNaN(port) || port < 1 || port > 65535) return '';
+                    return scheme + '://' + host + ':' + port;
+                } catch (_) { return ''; }
+            }
+            function apexGetRegistrableSite(originStr) {
+                try {
+                    if (!originStr) return '';
+                    const parts = String(originStr).split('://');
+                    if (parts.length !== 2) return '';
+                    const scheme = parts[0];
+                    const hp = parts[1].split(':');
+                    const host = hp[0];
+                    const port = hp[1] || '';
+                    if (!host) return '';
+                    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return scheme + '://' + host + ':' + port;
+                    const labels = host.split('.').filter(Boolean);
+                    if (labels.length <= 2) return scheme + '://' + host + ':' + port;
+                    const sld = labels[labels.length - 2];
+                    const tld = labels[labels.length - 1];
+                    const multi = { co:1, com:1, org:1, net:1, edu:1, gov:1, mil:1, ac:1, ne:1, or:1, go:1 };
+                    const site = (tld.length === 2 && multi[sld] && labels.length >= 3)
+                        ? labels.slice(-3).join('.')
+                        : labels.slice(-2).join('.');
+                    return scheme + '://' + site + ':' + port;
+                } catch (_) { return ''; }
+            }
+            function apexAreSameSite(url1, url2) {
+                const o1 = apexCanonOriginFromUrl(url1);
+                const o2 = apexCanonOriginFromUrl(url2);
+                if (!o1 || !o2) return false;
+                if (o1 === o2) return true;
+                const s1 = apexGetRegistrableSite(o1);
+                const s2 = apexGetRegistrableSite(o2);
+                return Boolean(s1 && s1 === s2);
+            }
             function apexIsConnected(el) {
                 if (!el) return false;
                 if (typeof el.isConnected === 'boolean') return el.isConnected;
@@ -1127,13 +1172,40 @@ object UniversalActionScripts {
                                         return { ok: false, code: 'ELEMENT_NOT_FOUND', matches: [], msg: 'Open shadowRoot unavailable on host.' };
                                     }
                                 } else if (tok.op === 'IFRAME') {
+                                    const remainingSel = tokens.slice(t).map(function(tk, ti) {
+                                        return (ti === 0 ? '' : (tk.op === 'SHADOW' ? ' >>> ' : ' >> ')) + tk.sel;
+                                    }).join('');
+                                    const framePrefix = tokens.slice(0, t).map(function(tk) { return tk.sel; }).join(' >> ');
+                                    const hostSrc = host && host.getAttribute ? (host.getAttribute('src') || host.src || '') : '';
                                     try {
                                         const subDoc = host && (host.contentDocument || (host.contentWindow && host.contentWindow.document));
                                         if (!subDoc) {
+                                            if (host && host.contentWindow && hostSrc && apexAreSameSite(window.location.href, hostSrc)) {
+                                                return {
+                                                    ok: false,
+                                                    code: 'PENDING_FRAME_EXEC',
+                                                    matches: [],
+                                                    bridgedFrameWin: host.contentWindow,
+                                                    localSelector: remainingSel,
+                                                    frameSelector: framePrefix,
+                                                    fullSelector: raw
+                                                };
+                                            }
                                             return { ok: false, code: 'CROSS_ORIGIN_BLOCKED', matches: [], msg: 'Iframe document is cross-origin or unloaded.' };
                                         }
                                         nextRoots.push(subDoc);
                                     } catch (_) {
+                                        if (host && host.contentWindow && hostSrc && apexAreSameSite(window.location.href, hostSrc)) {
+                                            return {
+                                                ok: false,
+                                                code: 'PENDING_FRAME_EXEC',
+                                                matches: [],
+                                                bridgedFrameWin: host.contentWindow,
+                                                localSelector: remainingSel,
+                                                frameSelector: framePrefix,
+                                                fullSelector: raw
+                                            };
+                                        }
                                         return { ok: false, code: 'CROSS_ORIGIN_BLOCKED', matches: [], msg: 'Blocked cross-origin iframe access.' };
                                     }
                                 }
@@ -1203,6 +1275,7 @@ object UniversalActionScripts {
                 let ambiguousElements = [];
                 let blockedCode = '';
                 let blockedMsg = '';
+                let pendingFrameBridge = null;
                 let chosen = null;
                 let matchedVia = '';
                 let usedFallback = false;
@@ -1242,7 +1315,9 @@ object UniversalActionScripts {
                             selected: false,
                             rejectedReason: qRes.code || 'QUERY_FAILED'
                         });
-                        if (qRes.code === 'CROSS_ORIGIN_BLOCKED' || qRes.code === 'ELEMENT_AMBIGUOUS') {
+                        if (qRes.code === 'PENDING_FRAME_EXEC' && qRes.bridgedFrameWin && !pendingFrameBridge) {
+                            pendingFrameBridge = qRes;
+                        } else if (qRes.code === 'CROSS_ORIGIN_BLOCKED' || qRes.code === 'ELEMENT_AMBIGUOUS') {
                             blockedCode = qRes.code;
                             blockedMsg = qRes.msg || '';
                             if (qRes.code === 'ELEMENT_AMBIGUOUS' && qRes.matches && qRes.matches.length > ambiguousElements.length) {
@@ -1475,6 +1550,9 @@ object UniversalActionScripts {
                 }
 
                 if (!chosen) {
+                    if (pendingFrameBridge && pendingFrameBridge.bridgedFrameWin) {
+                        return pendingFrameBridge;
+                    }
                     if (sawAmbiguous) {
                         const ambigInfos = ambiguousElements.map(function(el, i) { return apexCollectCandidateInfo(el, i); });
                         return {
@@ -1722,7 +1800,7 @@ object UniversalActionScripts {
                 else -> "input:not([type=\"hidden\"]):not([type=\"checkbox\"]):not([type=\"radio\"]):not([type=\"submit\"]):not([type=\"button\"]), textarea, select, [contenteditable=\"true\"], [contenteditable=\"plaintext-only\"], [role=\"textbox\"], [role=\"spinbutton\"], [role=\"combobox\"], [role=\"listbox\"], [data-datepicker], [data-year-picker], [data-birth-year], button[aria-haspopup]"
             }
             AutomationActionType.TOGGLE ->
-                "input[type=\"checkbox\"], input[type=\"radio\"], [role=\"checkbox\"], [role=\"switch\"], [role=\"radio\"]"
+                "input[type=\"checkbox\"], input[type=\"radio\"], [role=\"checkbox\"], [role=\"switch\"], [role=\"radio\"], [role=\"menuitemradio\"], [role=\"menuitemcheckbox\"], [aria-checked], [aria-pressed]"
             AutomationActionType.SELECT ->
                 "select, [role=\"combobox\"], [role=\"listbox\"], [role=\"option\"], [role=\"dialog\"], [role=\"grid\"], [role=\"menu\"], [role=\"menuitem\"], [role=\"menuitemradio\"], [role=\"menuitemcheckbox\"], [data-datepicker], [data-timepicker], [data-time-picker], [data-calendar], [data-year-picker], [data-birth-year], [data-bottom-sheet], [data-sheet], [data-drawer], [data-time], [data-slot], [data-country-code], [data-dial-code], button[aria-haspopup], .flatpickr-input, .bottom-sheet li, .calendar td, input:not([type=\"hidden\"]):not([type=\"checkbox\"]):not([type=\"radio\"]):not([type=\"submit\"]):not([type=\"button\"]), textarea"
             AutomationActionType.SUBMIT ->
@@ -1790,6 +1868,7 @@ object UniversalActionScripts {
             """.trimIndent()
         }
 
+        val qActionType = JSONObject.quote(step.actionType.id)
         return """
             (function() {
                 try {
@@ -1797,13 +1876,32 @@ object UniversalActionScripts {
                     const CANDIDATE_SELECTORS = $candidatesJson;
                     function apexResolveOrderedTarget(defaultQuery, opts) {
                         const queue = CANDIDATE_SELECTORS.length > 0 ? CANDIDATE_SELECTORS : ($qSel ? [$qSel] : []);
+                        let res;
                         if (queue.length === 1) {
-                            return apexResolveTarget(queue[0], $qLabel, defaultQuery, opts);
+                            res = apexResolveTarget(queue[0], $qLabel, defaultQuery, opts);
+                        } else if (queue.length === 0) {
+                            res = apexResolveTarget('', $qLabel, defaultQuery, opts);
+                        } else {
+                            res = apexResolveWithCandidates(queue, $qLabel, defaultQuery, opts);
                         }
-                        if (queue.length === 0) {
-                            return apexResolveTarget('', $qLabel, defaultQuery, opts);
+                        if (res && !res.ok && res.code === 'PENDING_FRAME_EXEC' && res.bridgedFrameWin) {
+                            const reqId = 'apex_fe_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+                            if (!window.__apexFrameExecResults) window.__apexFrameExecResults = {};
+                            try {
+                                res.bridgedFrameWin.postMessage({
+                                    type: 'APEX_FRAME_EXEC_REQ',
+                                    reqId: reqId,
+                                    actionType: $qActionType,
+                                    value: $qVal,
+                                    targetLabel: $qLabel,
+                                    localSelector: res.localSelector || '',
+                                    candidateSelectors: CANDIDATE_SELECTORS,
+                                    fullSelector: res.fullSelector || $qSel
+                                }, '*');
+                                return { ok: false, pendingFrameExec: true, frameExecReqId: reqId };
+                            } catch (_) {}
                         }
-                        return apexResolveWithCandidates(queue, $qLabel, defaultQuery, opts);
+                        return res;
                     }
                     function apexExtractWantedYear(raw) {
                         const parts = apexParseDateParts(raw);
@@ -2520,8 +2618,22 @@ object UniversalActionScripts {
             return JSON.stringify(apexSelectNativeOption(target, val, $qLabel, resolved));
         }
 
+        let hasMatchingComboboxOption = false;
+        if (tag === 'input' && !apexIsReadOnly(target) && val && (role === 'combobox' || target.hasAttribute('aria-controls') || target.hasAttribute('aria-haspopup'))) {
+            try {
+                const ctrlId = target.getAttribute('aria-controls') || target.getAttribute('aria-owns') || '';
+                const listEl = ctrlId ? doc.getElementById(ctrlId) : null;
+                if (listEl && apexIsVisible(listEl)) {
+                    const normVal = apexNorm(val);
+                    const optEls = Array.from(listEl.querySelectorAll('[role="option"], li, option'));
+                    hasMatchingComboboxOption = optEls.some(function(o) {
+                        return apexIsVisible(o) && apexNorm(o.innerText || o.textContent || o.getAttribute('data-value') || '') === normVal;
+                    });
+                }
+            } catch (_) {}
+        }
         const isCustomPickerTrigger = (tag !== 'input' && tag !== 'textarea' && apexIsCustomPickerOrDropdown(target)) ||
-            (tag === 'input' && (apexIsReadOnly(target) || role === 'combobox' || target.hasAttribute('aria-controls') || target.hasAttribute('aria-haspopup') || target.hasAttribute('data-year-picker')));
+            (tag === 'input' && (apexIsReadOnly(target) || target.hasAttribute('data-datepicker') || target.hasAttribute('data-year-picker') || hasMatchingComboboxOption));
         if (isCustomPickerTrigger && val) {
             return JSON.stringify(apexSelectCustomPickerOption(target, doc, win, val, $qLabel, resolved));
         }
@@ -2768,12 +2880,15 @@ object UniversalActionScripts {
         if (!resolved.ok) return JSON.stringify(resolved);
         let target = resolved.el;
         const doc = resolved.doc || document;
+        const win = resolved.win || window;
         let tag = (target.tagName || '').toLowerCase();
         let type = (target.getAttribute && target.getAttribute('type') || '').toLowerCase();
         let role = (target.getAttribute && target.getAttribute('role') || '').toLowerCase();
         const desiredState = $desiredCheckedLiteral;
         const isNativeToggle = tag === 'input' && (type === 'checkbox' || type === 'radio');
-        const isAriaToggle = role === 'checkbox' || role === 'switch' || role === 'radio';
+        const isAriaToggle = role === 'checkbox' || role === 'switch' || role === 'radio' ||
+            role === 'menuitemradio' || role === 'menuitemcheckbox' ||
+            Boolean(target.hasAttribute && (target.hasAttribute('aria-checked') || target.hasAttribute('aria-pressed')));
         if (!isNativeToggle && !isAriaToggle) {
             return JSON.stringify({
                 ok: false,
@@ -2839,14 +2954,20 @@ object UniversalActionScripts {
             if ((el.tagName || '').toLowerCase() === 'input' && ((el.getAttribute && el.getAttribute('type') || '').toLowerCase() === 'checkbox' || (el.getAttribute && el.getAttribute('type') || '').toLowerCase() === 'radio')) {
                 return Boolean(el.checked);
             }
-            return String(el.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+            if (el.hasAttribute && el.hasAttribute('aria-checked')) {
+                return String(el.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+            }
+            if (el.hasAttribute && el.hasAttribute('aria-pressed')) {
+                return String(el.getAttribute('aria-pressed') || '').toLowerCase() === 'true';
+            }
+            return false;
         }
         const beforeChecked = readState(target);
         const targetWanted = (isRadio && !isBooleanOption)
             ? true
             : (desiredState !== null ? desiredState : (isRadio ? true : !beforeChecked));
         if (beforeChecked !== targetWanted) {
-            target.click();
+            apexDispatchMouseClick(target, win);
             let afterClick = readState(target);
             if (afterClick !== targetWanted && tag === 'input') {
                 target.checked = targetWanted;
@@ -2894,9 +3015,12 @@ object UniversalActionScripts {
         }
 
         const targetType = (target.getAttribute && target.getAttribute('type') || '').toLowerCase();
-        if (!wantedRaw && (tag === 'input' || tag === 'textarea' || tag === 'select')) {
+        const isExplicitOptionEl = tag === 'option' || role === 'option' || role === 'menuitem' || role === 'menuitemradio' ||
+            (role === 'gridcell' && !target.querySelector('[role="gridcell"]')) ||
+            (target.hasAttribute('data-year') && !target.hasAttribute('data-year-picker'));
+        if (!wantedRaw && !isExplicitOptionEl) {
             try { target.focus(); } catch (_) {}
-            try { target.click(); } catch (_) {}
+            apexDispatchMouseClick(target, win);
             return JSON.stringify({
                 ok: true,
                 code: 'NONE',

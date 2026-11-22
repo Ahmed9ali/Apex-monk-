@@ -20,6 +20,7 @@ import android.view.PixelCopy
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.Window
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.URLUtil
@@ -165,6 +166,8 @@ import com.example.automation.ElementBoundingBox
 import com.example.automation.LocatorCandidate
 import com.example.automation.RecordedDomEvent
 import com.example.data.preferences.BrowserPreferences
+import com.example.devtools.ConsoleLogLevel
+import com.example.devtools.DevToolsCoordinator
 import com.example.engine.BuiltInShowcasePages
 import com.example.engine.PerformanceOptimizer
 import com.example.engine.PrivacyManager
@@ -295,6 +298,13 @@ fun WebViewViewport(
     onCloseFindInPage: () -> Unit = {},
     canCapturePreview: Boolean = true,
     onThumbnailCaptured: (String, Bitmap) -> Unit = { _, _ -> },
+    onDevToolsConsoleMessage: (String, ConsoleLogLevel, String, String, Int) -> Unit = { _, _, _, _, _ -> },
+    onDevToolsNetworkRequest: (String, String, String, String, String, Boolean, Boolean) -> Unit = { _, _, _, _, _, _, _ -> },
+    onDevToolsNetworkError: (String, String, String) -> Unit = { _, _, _ -> },
+    onDevToolsElementPicked: (String, String) -> Unit = { _, _ -> },
+    onToggleDevToolsShortcut: () -> Unit = {},
+    multiFrameBridgeScript: String = "",
+    onAllocateRecordingSequence: (String) -> Long = { 0L },
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -323,6 +333,12 @@ fun WebViewViewport(
     val currentOnDomMutationBatch by rememberUpdatedState(onDomMutationBatch)
     val currentOnFindInPageResults by rememberUpdatedState(onFindInPageResults)
     val currentOnThumbnailCaptured by rememberUpdatedState(onThumbnailCaptured)
+    val currentOnDevToolsConsoleMessage by rememberUpdatedState(onDevToolsConsoleMessage)
+    val currentOnDevToolsNetworkRequest by rememberUpdatedState(onDevToolsNetworkRequest)
+    val currentOnDevToolsNetworkError by rememberUpdatedState(onDevToolsNetworkError)
+    val currentOnDevToolsElementPicked by rememberUpdatedState(onDevToolsElementPicked)
+    val currentOnToggleDevToolsShortcut by rememberUpdatedState(onToggleDevToolsShortcut)
+    val currentOnAllocateRecordingSequence by rememberUpdatedState(onAllocateRecordingSequence)
 
     var lastAppliedScriptGuard by remember(tab.id) {
         mutableStateOf(preferences.scriptGuardEnabled)
@@ -424,9 +440,20 @@ fun WebViewViewport(
                 currentOnFindInPageResults(currentTab.id, activeMatchOrdinal, numberOfMatches)
             }
             setOnKeyListener { _, keyCode, event ->
-                if (keyCode == KeyEvent.KEYCODE_F7 && event.action == KeyEvent.ACTION_DOWN) {
-                    currentOnToggleCaretBrowsingShortcut()
-                    true
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    val isDevToolsShortcut = keyCode == KeyEvent.KEYCODE_F12 ||
+                        (keyCode == KeyEvent.KEYCODE_I && event.isCtrlPressed && event.isShiftPressed)
+                    when {
+                        isDevToolsShortcut -> {
+                            currentOnToggleDevToolsShortcut()
+                            true
+                        }
+                        keyCode == KeyEvent.KEYCODE_F7 -> {
+                            currentOnToggleCaretBrowsingShortcut()
+                            true
+                        }
+                        else -> false
+                    }
                 } else {
                     false
                 }
@@ -465,6 +492,11 @@ fun WebViewViewport(
                 removeJavascriptInterface("ApexAutomationBridge")
                 addJavascriptInterface(
                     object {
+                        @JavascriptInterface
+                        fun allocateRecordedSequence(sessionId: String?): Long {
+                            return currentOnAllocateRecordingSequence(sessionId?.trim().orEmpty())
+                        }
+
                         @JavascriptInterface
                         fun onRecordedEventJson(payloadJson: String?) {
                             val raw = payloadJson?.trim().orEmpty()
@@ -531,7 +563,8 @@ fun WebViewViewport(
                                     ambiguousCandidates = ambigCands,
                                     tagName = obj.optString("tagName", "").trim().lowercase(),
                                     boundingBox = ElementBoundingBox.fromJson(obj.optJSONObject("boundingBox")),
-                                    sensitiveCapturedValue = if (isPwd) obj.optString("vaultSecret", "") else ""
+                                    sensitiveCapturedValue = if (isPwd) obj.optString("vaultSecret", "") else "",
+                                    isSubframe = obj.optBoolean("isSubframe", false)
                                 )
                             }.getOrNull() ?: RecordedDomEvent(
                                 sessionId = "",
@@ -598,6 +631,22 @@ fun WebViewViewport(
                         }
                     },
                     "ApexAutomationBridge"
+                )
+            }
+            runCatching {
+                removeJavascriptInterface("ApexDevToolsBridge")
+                addJavascriptInterface(
+                    object {
+                        @JavascriptInterface
+                        fun onElementPicked(selector: String?) {
+                            val clean = selector?.trim().orEmpty()
+                            if (clean.isEmpty()) return
+                            post {
+                                currentOnDevToolsElementPicked(currentTab.id, clean)
+                            }
+                        }
+                    },
+                    "ApexDevToolsBridge"
                 )
             }
             var lastTouchLocalX = 0f
@@ -811,14 +860,39 @@ fun WebViewViewport(
             }
 
             webChromeClient = object : WebChromeClient() {
+                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                    if (consoleMessage != null) {
+                        val level = when (consoleMessage.messageLevel()) {
+                            ConsoleMessage.MessageLevel.ERROR -> ConsoleLogLevel.ERROR
+                            ConsoleMessage.MessageLevel.WARNING -> ConsoleLogLevel.WARN
+                            ConsoleMessage.MessageLevel.TIP -> ConsoleLogLevel.INFO
+                            ConsoleMessage.MessageLevel.DEBUG -> ConsoleLogLevel.DEBUG
+                            else -> ConsoleLogLevel.LOG
+                        }
+                        val msg = consoleMessage.message().orEmpty()
+                        val src = consoleMessage.sourceId().orEmpty()
+                        val line = consoleMessage.lineNumber()
+                        post {
+                            currentOnDevToolsConsoleMessage(
+                                currentTab.id,
+                                level,
+                                msg,
+                                src,
+                                line
+                            )
+                        }
+                    }
+                    return super.onConsoleMessage(consoleMessage)
+                }
+
                 override fun onCreateWindow(
                     view: WebView?,
                     isDialog: Boolean,
                     isUserGesture: Boolean,
                     resultMsg: android.os.Message?
                 ): Boolean {
-                    // Block unsolicited popup and pop-under ad windows
-                    if (currentPreferences.shieldsEnabled) {
+                    // Block unsolicited popup and pop-under ad windows, while permitting user-gesture popups (e.g. OAuth sign-in)
+                    if (currentPreferences.shieldsEnabled && !isUserGesture) {
                         return false
                     }
                     return super.onCreateWindow(view, isDialog, isUserGesture, resultMsg)
@@ -956,7 +1030,26 @@ fun WebViewViewport(
                     request: WebResourceRequest?
                 ): WebResourceResponse? {
                     val reqUrl = request?.url?.toString().orEmpty()
+                    val method = request?.method?.ifBlank { "GET" } ?: "GET"
+                    val fetchDest = request?.requestHeaders?.entries
+                        ?.firstOrNull { it.key.equals("Sec-Fetch-Dest", ignoreCase = true) }
+                        ?.value
+                        ?.takeIf { it.isNotBlank() }
+                        ?: if (request?.isForMainFrame == true) "document" else DevToolsCoordinator.inferResourceType(reqUrl)
                     if (request?.isForMainFrame == true) {
+                        if (reqUrl.isNotBlank()) {
+                            post {
+                                currentOnDevToolsNetworkRequest(
+                                    currentTab.id,
+                                    reqUrl,
+                                    method,
+                                    fetchDest,
+                                    "Requested",
+                                    false,
+                                    false
+                                )
+                            }
+                        }
                         return super.shouldInterceptRequest(view, request)
                     }
                     val activePageUrl = liveMainFrameUrl.get().ifBlank { currentTab.url }
@@ -966,6 +1059,17 @@ fun WebViewViewport(
                         shieldsEnabled = currentPreferences.shieldsEnabled
                     )
                     if (result.blocked) {
+                        post {
+                            currentOnDevToolsNetworkRequest(
+                                currentTab.id,
+                                reqUrl,
+                                method,
+                                fetchDest,
+                                "Blocked (${result.category})",
+                                true,
+                                false
+                            )
+                        }
                         currentOnSubresourceBlocked(
                             currentTab.id,
                             currentTab.title,
@@ -978,6 +1082,19 @@ fun WebViewViewport(
                             requestUrl = reqUrl,
                             requestHeaders = request?.requestHeaders
                         )
+                    }
+                    if (reqUrl.isNotBlank()) {
+                        post {
+                            currentOnDevToolsNetworkRequest(
+                                currentTab.id,
+                                reqUrl,
+                                method,
+                                fetchDest,
+                                "200 OK",
+                                false,
+                                false
+                            )
+                        }
                     }
                     return super.shouldInterceptRequest(view, request)
                 }
@@ -1054,6 +1171,17 @@ fun WebViewViewport(
                     error: WebResourceError?
                 ) {
                     super.onReceivedError(view, request, error)
+                    val errUrl = request?.url?.toString().orEmpty()
+                    val errReason = error?.description?.toString()?.takeIf { it.isNotBlank() } ?: "Error"
+                    if (errUrl.isNotBlank() && !errReason.contains("ERR_ABORTED", ignoreCase = true)) {
+                        post {
+                            currentOnDevToolsNetworkError(
+                                currentTab.id,
+                                errUrl,
+                                errReason
+                            )
+                        }
+                    }
                     if (request?.isForMainFrame == true) {
                         val reqUrl = request.url?.toString().orEmpty()
                         val code = error?.errorCode ?: -1
@@ -1086,6 +1214,25 @@ fun WebViewViewport(
                             errorCode = code
                         )
                         currentOnPageLoadFailedWithReason(currentTab.id, reqUrl, reason)
+                    }
+                }
+
+                override fun onReceivedHttpError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    errorResponse: WebResourceResponse?
+                ) {
+                    super.onReceivedHttpError(view, request, errorResponse)
+                    val reqUrl = request?.url?.toString().orEmpty()
+                    val code = errorResponse?.statusCode ?: return
+                    if (reqUrl.isNotBlank() && code >= 400) {
+                        post {
+                            currentOnDevToolsNetworkError(
+                                currentTab.id,
+                                reqUrl,
+                                "HTTP $code"
+                            )
+                        }
                     }
                 }
 
@@ -1147,8 +1294,9 @@ fun WebViewViewport(
         webView.setBackgroundColor(canvasColorArgb)
     }
 
-    DisposableEffect(webView, preferences.shieldsEnabled, preferences.scriptGuardEnabled) {
+    DisposableEffect(webView, preferences.shieldsEnabled, preferences.scriptGuardEnabled, multiFrameBridgeScript) {
         var scriptHandler: ScriptHandler? = null
+        var bridgeScriptHandler: ScriptHandler? = null
         if (preferences.shieldsEnabled && !preferences.scriptGuardEnabled) {
             val stealthScript = privacyManager.buildStealthAdblockScript(true)
             if (stealthScript.isNotEmpty()) {
@@ -1163,8 +1311,20 @@ fun WebViewViewport(
                 }
             }
         }
+        if (!preferences.scriptGuardEnabled && multiFrameBridgeScript.isNotBlank()) {
+            runCatching {
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                    bridgeScriptHandler = WebViewCompat.addDocumentStartJavaScript(
+                        webView,
+                        multiFrameBridgeScript,
+                        setOf("*")
+                    )
+                }
+            }
+        }
         onDispose {
             runCatching { scriptHandler?.remove() }
+            runCatching { bridgeScriptHandler?.remove() }
         }
     }
 

@@ -493,9 +493,8 @@ class PrivacyManager {
             )
         }
 
-        // Fast domain-suffix matching against Ad Networks
+        // Host-based domain-suffix matching against Ad Networks
         val matchedAd = matchDomainOrSubdomain(host, adNetworkDomains)
-            ?: adNetworkPatterns.firstOrNull { lower.contains(it) }
         if (matchedAd != null) {
             return BlockInterceptionResult(
                 blocked = true,
@@ -506,9 +505,8 @@ class PrivacyManager {
             )
         }
 
-        // Fast domain-suffix matching against Trackers
+        // Host-based domain-suffix matching against Trackers
         val matchedTracker = matchDomainOrSubdomain(host, trackerDomains)
-            ?: trackerPatterns.firstOrNull { lower.contains(it) }
         if (matchedTracker != null) {
             return BlockInterceptionResult(
                 blocked = true,
@@ -520,7 +518,10 @@ class PrivacyManager {
         }
 
         // First-party root resources that don't match explicit ad/tracker path signatures are allowed
-        val matchedPath = urlPathSignatures.firstOrNull { lower.contains(it) }
+        val lowerPathOnly = lower.substringBefore('?').substringBefore('#')
+        val matchedPath = urlPathSignatures.firstOrNull { sig ->
+            if (sig.contains('?')) lower.contains(sig) else lowerPathOnly.contains(sig)
+        }
         if (matchedPath != null) {
             return BlockInterceptionResult(
                 blocked = true,
@@ -618,6 +619,15 @@ class PrivacyManager {
             ?.firstOrNull { it.key.equals("Origin", ignoreCase = true) }
             ?.value
             ?.takeIf { it.isNotBlank() }
+        val secFetchDest = requestHeaders?.entries
+            ?.firstOrNull { it.key.equals("Sec-Fetch-Dest", ignoreCase = true) }
+            ?.value
+            ?.lowercase()
+            .orEmpty()
+        val xRequestedWith = requestHeaders?.entries
+            ?.firstOrNull { it.key.equals("X-Requested-With", ignoreCase = true) }
+            ?.value
+            .orEmpty()
 
         val corsHeaders = buildMap {
             if (requestOrigin != null) {
@@ -668,6 +678,10 @@ class PrivacyManager {
             fullLowerUrl.contains("/api/stats/ads") ||
             lowerUrl.contains("/openrtb") ||
             lowerUrl.contains("/bidder") ||
+            lowerUrl.contains("/v1/") ||
+            lowerUrl.contains("/api/") ||
+            secFetchDest == "empty" ||
+            xRequestedWith.isNotBlank() ||
             accept.contains("application/json")
 
         val isCss = lowerUrl.endsWith(".css") ||

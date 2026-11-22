@@ -58,6 +58,7 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.KeyboardArrowDown
@@ -1404,6 +1405,7 @@ fun BrowserMenuBottomSheet(
     onFindInPageClick: () -> Unit = {},
     onOpenAutomationHudClick: () -> Unit = {},
     onOpenAutomationWorkspaceClick: () -> Unit = {},
+    onOpenDevToolsClick: () -> Unit = {},
     onOpenBookmarksClick: () -> Unit = {},
     isProActivated: Boolean = false,
     remainingFreePlaysToday: Int = BrowserPreferences.FREE_DAILY_AUTOMATION_PLAY_LIMIT,
@@ -1468,12 +1470,12 @@ fun BrowserMenuBottomSheet(
                     )
                 }
 
-                // Primary Home Group: New private tab above Automation
+                // Primary Home Group: New private tab, Automation, Developer tools
                 Column(
                     verticalArrangement = Arrangement.spacedBy(GroupedListSpacing),
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    val homePrivateTabShape = groupedListItemShape(0, 2)
+                    val homePrivateTabShape = groupedListItemShape(0, 3)
                     Surface(
                         shape = homePrivateTabShape,
                         color = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -1511,7 +1513,7 @@ fun BrowserMenuBottomSheet(
                         }
                     }
 
-                    val homeAutomationShape = groupedListItemShape(1, 2)
+                    val homeAutomationShape = groupedListItemShape(1, 3)
                     Surface(
                         shape = homeAutomationShape,
                         color = MaterialTheme.colorScheme.surfaceContainerLow,
@@ -1548,6 +1550,57 @@ fun BrowserMenuBottomSheet(
                                 color = MaterialTheme.colorScheme.onSurface,
                                 modifier = Modifier.weight(1f)
                             )
+                        }
+                    }
+
+                    val homeDevToolsShape = groupedListItemShape(2, 3)
+                    Surface(
+                        shape = homeDevToolsShape,
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(
+                            0.75.dp,
+                            MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(homeDevToolsShape)
+                            .clickable(role = Role.Button) {
+                                onDismiss()
+                                onOpenDevToolsClick()
+                            }
+                            .testTag("menu_sheet_developer_tools")
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .defaultMinSize(minHeight = 58.dp)
+                                .padding(horizontal = 16.dp, vertical = 12.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Code,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Spacer(modifier = Modifier.width(16.dp))
+                            Column(
+                                verticalArrangement = Arrangement.spacedBy(2.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.menu_developer_tools),
+                                    style = EmphasizedTypography.activeTabTitle,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                )
+                                Text(
+                                    text = stringResource(R.string.menu_developer_tools_subtitle),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
                     }
                 }
@@ -1771,14 +1824,14 @@ fun BrowserMenuBottomSheet(
                             )
                         }
 
-                        // Group 1: Bookmark page, Find in page, Desktop site, New private tab, Automation, More (+ expandable sub-items)
+                        // Group 1: Bookmark page, Find in page, Desktop site, New private tab, Automation, Developer tools, More (+ expandable sub-items)
                         val secondaryMoreCount = if (isMoreExpanded) {
                             2 + if (!isDefaultBrowser) 1 else 0
                         } else {
                             0
                         }
                         val automationExpandedCount = if (isAutomationExpanded) 2 else 0
-                        val group1TotalCount = 6 + automationExpandedCount + secondaryMoreCount
+                        val group1TotalCount = 7 + automationExpandedCount + secondaryMoreCount
 
                         Column(
                             verticalArrangement = Arrangement.spacedBy(GroupedListSpacing),
@@ -2099,7 +2152,59 @@ fun BrowserMenuBottomSheet(
                                 )
                             }
 
-                            // 5. More (expandable secondary browser actions; scrolls inside fixed sheet height)
+                            // 6. Developer tools
+                            val devToolsShape = groupedListItemShape(group1Idx++, group1TotalCount)
+                            Surface(
+                                shape = devToolsShape,
+                                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                                border = BorderStroke(
+                                    0.75.dp,
+                                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(devToolsShape)
+                                    .clickable(role = Role.Button) {
+                                        onDismiss()
+                                        onOpenDevToolsClick()
+                                    }
+                                    .testTag("menu_sheet_developer_tools")
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .defaultMinSize(minHeight = 62.dp)
+                                        .padding(horizontal = 16.dp, vertical = 10.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Code,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.size(22.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(16.dp))
+                                    Column(
+                                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text(
+                                            text = stringResource(R.string.menu_developer_tools),
+                                            style = EmphasizedTypography.activeTabTitle,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = stringResource(R.string.menu_developer_tools_subtitle),
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                }
+                            }
+
+                            // 7. More (expandable secondary browser actions; scrolls inside fixed sheet height)
                             val moreChevronRotation by animateFloatAsState(
                                 targetValue = if (isMoreExpanded) 180f else 0f,
                                 animationSpec = ApexMotion.spatialSpring(),

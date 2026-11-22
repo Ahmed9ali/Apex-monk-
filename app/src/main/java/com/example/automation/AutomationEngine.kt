@@ -581,6 +581,43 @@ class AutomationEngine(
             first.canonicalOrigin == second.canonicalOrigin
     }
 
+    fun extractRegistrableSite(urlOrOrigin: String?): String {
+        val parsed = parseOrigin(urlOrOrigin) as? RecordingOriginResult.Valid ?: return ""
+        val host = parsed.host.trim().trimEnd('.').lowercase()
+        if (host.isEmpty()) return ""
+        if (Regex("^\\d{1,3}(?:\\.\\d{1,3}){3}$").matches(host) || host.contains(':')) {
+            return host
+        }
+        val labels = host.split('.').filter { it.isNotEmpty() }
+        if (labels.size <= 2) return host
+        val secondLast = labels[labels.size - 2]
+        val last = labels.last()
+        val multiPartSlds = setOf(
+            "co", "com", "org", "net", "edu", "gov", "mil", "ac", "ne", "or", "go", "gr", "ed"
+        )
+        val isTwoPartPublicSuffix = last.length == 2 && secondLast in multiPartSlds && labels.size >= 3
+        return if (isTwoPartPublicSuffix) {
+            labels.takeLast(3).joinToString(".")
+        } else {
+            labels.takeLast(2).joinToString(".")
+        }
+    }
+
+    fun areSameSiteOrigins(firstUrl: String?, secondUrl: String?): Boolean {
+        val first = parseOrigin(firstUrl)
+        val second = parseOrigin(secondUrl)
+        if (first !is RecordingOriginResult.Valid || second !is RecordingOriginResult.Valid) {
+            return false
+        }
+        if (first.canonicalOrigin == second.canonicalOrigin) return true
+        if (first.scheme != second.scheme || first.effectivePort != second.effectivePort) {
+            return false
+        }
+        val siteA = extractRegistrableSite(first.canonicalOrigin)
+        val siteB = extractRegistrableSite(second.canonicalOrigin)
+        return siteA.isNotEmpty() && siteA == siteB
+    }
+
     internal fun buildRecorderInstallScript(
         sessionId: String,
         tabId: String,
@@ -591,6 +628,362 @@ class AutomationEngine(
         val qTabId = JSONObject.quote(tabId)
         val qExpectedOrigin = JSONObject.quote(expectedOrigin)
         val safeInitialSeq = initialSequenceNumber.coerceAtLeast(0L)
+        return buildRecorderCoreScript(
+            qSessionId = qSessionId,
+            qTabId = qTabId,
+            qExpectedOrigin = qExpectedOrigin,
+            safeInitialSeq = safeInitialSeq,
+            subframeMode = false,
+            frameSelectorExpr = "''"
+        )
+    }
+
+    fun buildMultiFrameDocumentStartScript(): String {
+        val subframeRecorderFactory = buildRecorderCoreScript(
+            qSessionId = "__cfg.sessionId",
+            qTabId = "__cfg.tabId",
+            qExpectedOrigin = "__cfg.expectedOrigin",
+            safeInitialSeq = 0L,
+            subframeMode = true,
+            frameSelectorExpr = "(__cfg.frameSelector || 'iframe')"
+        )
+        return """
+            (function() {
+                try {
+                    function getCanonOrig(w) {
+                        try {
+                            var loc = (w || window).location;
+                            if (!loc) return '';
+                            var proto = String(loc.protocol || '').toLowerCase();
+                            if (proto !== 'http:' && proto !== 'https:') return '';
+                            var scheme = proto.slice(0, -1);
+                            var host = String(loc.hostname || '').trim().replace(/\.+$/, '').toLowerCase();
+                            if (!host) return '';
+                            var rawPort = String(loc.port || '');
+                            var port = rawPort ? parseInt(rawPort, 10) : (scheme === 'http' ? 80 : 443);
+                            if (!port || isNaN(port) || port < 1 || port > 65535) return '';
+                            return scheme + '://' + host + ':' + port;
+                        } catch (_) { return ''; }
+                    }
+                    function getRegSite(originStr) {
+                        try {
+                            if (!originStr) return '';
+                            var parts = originStr.split('://');
+                            if (parts.length !== 2) return '';
+                            var scheme = parts[0];
+                            var hp = parts[1].split(':');
+                            var host = hp[0];
+                            var port = hp[1] || '';
+                            if (!host) return '';
+                            if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return scheme + '://' + host + ':' + port;
+                            var labels = host.split('.').filter(Boolean);
+                            if (labels.length <= 2) return scheme + '://' + host + ':' + port;
+                            var sld = labels[labels.length - 2];
+                            var tld = labels[labels.length - 1];
+                            var multi = { co:1, com:1, org:1, net:1, edu:1, gov:1, mil:1, ac:1, ne:1, or:1, go:1 };
+                            var site = (tld.length === 2 && multi[sld] && labels.length >= 3)
+                                ? labels.slice(-3).join('.')
+                                : labels.slice(-2).join('.');
+                            return scheme + '://' + site + ':' + port;
+                        } catch (_) { return ''; }
+                    }
+                    function areSameSite(o1, o2) {
+                        if (!o1 || !o2) return false;
+                        if (o1 === o2) return true;
+                        var s1 = getRegSite(o1);
+                        var s2 = getRegSite(o2);
+                        return Boolean(s1 && s1 === s2);
+                    }
+                    if (window === window.top) {
+                        window.__apexSubframeScanCache = window.__apexSubframeScanCache || {};
+                        window.__apexFrameExecResults = window.__apexFrameExecResults || {};
+                        if (!window.__apexTopFrameBridgeInstalled) {
+                            window.__apexTopFrameBridgeInstalled = true;
+                            window.addEventListener('message', function(e) {
+                                try {
+                                    var d = e && e.data;
+                                    if (!d || typeof d !== 'object') return;
+                                    var topOrig = getCanonOrig(window);
+                                    if (!e.origin || !topOrig || !areSameSite(topOrig, e.origin.replace(/^(https?):\/\/([^:]+)$/, function(_, s, h) { return s + '://' + h + ':' + (s === 'http' ? 80 : 443); }))) {
+                                        var normMsgOrig = '';
+                                        try {
+                                            var u = new URL(e.origin);
+                                            var p = u.port || (u.protocol === 'http:' ? '80' : '443');
+                                            normMsgOrig = u.protocol.slice(0, -1) + '://' + u.hostname.toLowerCase() + ':' + p;
+                                        } catch (_) {}
+                                        if (!areSameSite(topOrig, normMsgOrig)) return;
+                                    }
+                                    if (d.type === 'APEX_FRAME_HELLO') {
+                                        var frms = document.querySelectorAll('iframe');
+                                        var matchedSel = 'iframe';
+                                        for (var fi = 0; fi < frms.length; fi++) {
+                                            var f = frms[fi];
+                                            try {
+                                                if (f.contentWindow === e.source) {
+                                                    if (f.id && !/\d{6,}/.test(f.id)) matchedSel = 'iframe#' + f.id;
+                                                    else if (f.getAttribute('name')) matchedSel = 'iframe[name="' + f.getAttribute('name') + '"]';
+                                                    else if (frms.length > 1) matchedSel = 'iframe:nth-of-type(' + (fi + 1) + ')';
+                                                    break;
+                                                }
+                                            } catch (_) {}
+                                        }
+                                        try {
+                                            e.source.postMessage({ type: 'APEX_FRAME_CONFIG', frameSelector: matchedSel }, '*');
+                                        } catch (_) {}
+                                        var cfg = window.__apexRecorderConfig;
+                                        if (cfg && cfg.active && window.__apexRecordingActive) {
+                                            try {
+                                                e.source.postMessage({
+                                                    type: 'APEX_RECORDER_SYNC',
+                                                    active: true,
+                                                    sessionId: cfg.sessionId,
+                                                    tabId: cfg.tabId,
+                                                    expectedOrigin: getCanonOrig(window),
+                                                    frameSelector: matchedSel
+                                                }, '*');
+                                            } catch (_) {}
+                                        }
+                                    } else if (d.type === 'APEX_FRAME_SCAN_RES') {
+                                        if (d.frameSelector) {
+                                            window.__apexSubframeScanCache[d.frameSelector] = {
+                                                frameSelector: d.frameSelector,
+                                                frameOrigin: d.frameOrigin || '',
+                                                elements: Array.isArray(d.elements) ? d.elements : [],
+                                                updatedAt: Date.now()
+                                            };
+                                        }
+                                    } else if (d.type === 'APEX_FRAME_EXEC_RES') {
+                                        if (d.reqId) {
+                                            window.__apexFrameExecResults[d.reqId] = d.result;
+                                        }
+                                    } else if (d.type === 'APEX_RECORDER_EMIT') {
+                                        if (d.payloadJson && window.ApexAutomationBridge && window.ApexAutomationBridge.onRecordedEventJson) {
+                                            window.ApexAutomationBridge.onRecordedEventJson(d.payloadJson);
+                                        }
+                                    }
+                                } catch (_) {}
+                            });
+                        }
+                        return;
+                    }
+
+                    // Subframe bridge handler (accounts.zomato.com inside www.zomato.com, etc.)
+                    window.__apexFrameSelector = window.__apexFrameSelector || 'iframe';
+                    function installSubframeRecorder(__cfg) {
+                        $subframeRecorderFactory
+                    }
+                    function collectSubframeElements() {
+                        var out = [];
+                        var fSel = window.__apexFrameSelector || 'iframe';
+                        var fOrig = getCanonOrig(window);
+                        var q = 'input:not([type="hidden"]), textarea, select, button, a[href], [role="button"], [role="link"], [role="combobox"], [role="textbox"], [role="checkbox"], [role="radio"], [role="switch"], [contenteditable="true"], [tabindex]:not([tabindex="-1"])';
+                        var nodes = document.querySelectorAll ? document.querySelectorAll(q) : [];
+                        var max = Math.min(nodes.length, 150);
+                        for (var i = 0; i < max; i++) {
+                            var el = nodes[i];
+                            if (!el || !el.tagName) continue;
+                            var st = null;
+                            try { st = window.getComputedStyle(el); } catch (_) {}
+                            if (st && (st.display === 'none' || st.visibility === 'hidden' || parseFloat(st.opacity) === 0)) continue;
+                            var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                            if (r && r.width === 0 && r.height === 0) continue;
+                            var tag = el.tagName.toLowerCase();
+                            var type = (el.getAttribute('type') || '').toLowerCase();
+                            var name = el.getAttribute('name') || '';
+                            var aria = el.getAttribute('aria-label') || '';
+                            var ph = el.getAttribute('placeholder') || '';
+                            var dt = el.getAttribute('data-testid') || '';
+                            var localSel = (el.id && !/\d{6,}/.test(el.id)) ? ('#' + el.id) :
+                                (dt ? (tag + '[data-testid="' + dt + '"]') :
+                                (aria ? (tag + '[aria-label="' + aria + '"]') :
+                                (name ? (tag + '[name="' + name + '"]') :
+                                (ph ? (tag + '[placeholder="' + ph + '"]') :
+                                (tag + (type ? ('[type="' + type + '"]') : ''))))));
+                            var lbl = aria || ph || (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+                            if (!lbl && el.nextElementSibling) {
+                                lbl = (el.nextElementSibling.innerText || el.nextElementSibling.textContent || '').replace(/\s+/g, ' ').trim();
+                            }
+                            if (!lbl && el.previousElementSibling) {
+                                lbl = (el.previousElementSibling.innerText || el.previousElementSibling.textContent || '').replace(/\s+/g, ' ').trim();
+                            }
+                            lbl = (lbl || tag).slice(0, 80);
+                            var fullSel = fSel + ' >> ' + localSel;
+                            out.push({
+                                tag: tag,
+                                inputType: type,
+                                role: el.getAttribute('role') || (tag === 'a' ? 'link' : tag),
+                                label: lbl,
+                                accessibleName: lbl,
+                                visibleText: (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+                                placeholder: ph,
+                                name: name,
+                                htmlId: el.id || '',
+                                selector: fullSel,
+                                framePath: [fSel],
+                                frameOrigin: fOrig,
+                                frameUrl: String(window.location && window.location.href || ''),
+                                visible: true,
+                                interactable: !Boolean(el.disabled),
+                                disabled: Boolean(el.disabled),
+                                readonly: Boolean(el.readOnly),
+                                locatorCandidates: [{
+                                    strategy: 'IFRAME_CHAIN',
+                                    selector: fullSel,
+                                    scope: 'IFRAME',
+                                    confidence: 0.9,
+                                    isUnique: true,
+                                    matchCount: 1,
+                                    isAmbiguous: false,
+                                    stability: 'HIGH'
+                                }]
+                            });
+                        }
+                        return out;
+                    }
+                    function pushScanSnapshot() {
+                        try {
+                            window.top.postMessage({
+                                type: 'APEX_FRAME_SCAN_RES',
+                                frameSelector: window.__apexFrameSelector || 'iframe',
+                                frameOrigin: getCanonOrig(window),
+                                elements: collectSubframeElements()
+                            }, '*');
+                        } catch (_) {}
+                    }
+                    function execStepInSubframe(req) {
+                        try {
+                            var action = String(req.actionType || '').toUpperCase();
+                            var sel = String(req.localSelector || '').trim();
+                            var cands = Array.isArray(req.candidateSelectors) ? req.candidateSelectors : [];
+                            var val = String(req.value || '');
+                            var labelHint = String(req.targetLabel || '').trim().toLowerCase();
+                            var target = null;
+                            var tryList = sel ? [sel].concat(cands) : cands;
+                            for (var i = 0; i < tryList.length && !target; i++) {
+                                var s = String(tryList[i] || '').replace(/^.*?>>\s*/, '').trim();
+                                if (!s) continue;
+                                try {
+                                    var found = Array.from(document.querySelectorAll(s)).filter(function(el) {
+                                        var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                                        return !r || (r.width > 0 && r.height > 0);
+                                    });
+                                    if (found.length === 1) target = found[0];
+                                    else if (found.length > 1 && labelHint) {
+                                        for (var k = 0; k < found.length; k++) {
+                                            var t = ((found[k].getAttribute('aria-label') || found[k].getAttribute('placeholder') || found[k].innerText || found[k].textContent || '')).toLowerCase();
+                                            if (t.indexOf(labelHint) >= 0) { target = found[k]; break; }
+                                        }
+                                    }
+                                    if (!target && found.length > 0) target = found[0];
+                                } catch (_) {}
+                            }
+                            if (!target) {
+                                return { ok: false, code: 'ELEMENT_NOT_FOUND', msg: 'Subframe element not found for ' + (req.targetLabel || sel) };
+                            }
+                            var tag = (target.tagName || '').toLowerCase();
+                            try { target.focus(); } catch (_) {}
+                            if (action === 'INPUT') {
+                                var proto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                                var desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+                                if (desc && desc.set) desc.set.call(target, val);
+                                else target.value = val;
+                                target.dispatchEvent(new Event('beforeinput', { bubbles: true, cancelable: true }));
+                                target.dispatchEvent(new Event('input', { bubbles: true }));
+                                target.dispatchEvent(new Event('change', { bubbles: true }));
+                                return { ok: true, code: 'NONE', verified: true, resolvedSelector: req.fullSelector || sel, msg: 'Entered value in subframe.' };
+                            } else if (action === 'CLEAR') {
+                                var cProto = tag === 'textarea' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                                var cDesc = cProto ? Object.getOwnPropertyDescriptor(cProto, 'value') : null;
+                                if (cDesc && cDesc.set) cDesc.set.call(target, '');
+                                else target.value = '';
+                                target.dispatchEvent(new Event('input', { bubbles: true }));
+                                target.dispatchEvent(new Event('change', { bubbles: true }));
+                                return { ok: true, code: 'NONE', verified: true, msg: 'Cleared subframe input.' };
+                            } else if (action === 'CLICK' || action === 'SUBMIT' || action === 'TOGGLE') {
+                                target.click();
+                                return { ok: true, code: 'NONE', verified: true, resolvedSelector: req.fullSelector || sel, msg: 'Clicked in subframe.' };
+                            } else if (action === 'SELECT' && tag === 'select') {
+                                target.value = val;
+                                target.dispatchEvent(new Event('change', { bubbles: true }));
+                                return { ok: true, code: 'NONE', verified: true, msg: 'Selected option in subframe.' };
+                            } else if (action === 'KEY_PRESS') {
+                                target.dispatchEvent(new KeyboardEvent('keydown', { key: val || 'Enter', bubbles: true, cancelable: true }));
+                                target.dispatchEvent(new KeyboardEvent('keyup', { key: val || 'Enter', bubbles: true, cancelable: true }));
+                                return { ok: true, code: 'NONE', verified: true, msg: 'Pressed key in subframe.' };
+                            }
+                            target.click();
+                            return { ok: true, code: 'NONE', verified: true, msg: 'Executed action in subframe.' };
+                        } catch (err) {
+                            return { ok: false, code: 'JS_EXCEPTION', msg: String(err && err.message || err) };
+                        }
+                    }
+                    function sendHello() {
+                        try { window.top.postMessage({ type: 'APEX_FRAME_HELLO' }, '*'); } catch (_) {}
+                    }
+                    window.addEventListener('message', function(e) {
+                        try {
+                            if (e.source !== window.top) return;
+                            var d = e.data;
+                            if (!d || typeof d !== 'object') return;
+                            if (d.type === 'APEX_FRAME_CONFIG') {
+                                window.__apexFrameSelector = d.frameSelector || 'iframe';
+                                pushScanSnapshot();
+                            } else if (d.type === 'APEX_RECORDER_SYNC') {
+                                if (!d.active) {
+                                    if (window.__apexRecorderInstance && typeof window.__apexRecorderInstance.cleanup === 'function') {
+                                        window.__apexRecorderInstance.cleanup();
+                                    }
+                                    return;
+                                }
+                                var myOrig = getCanonOrig(window);
+                                if (!areSameSite(myOrig, d.expectedOrigin)) return;
+                                window.__apexFrameSelector = d.frameSelector || window.__apexFrameSelector || 'iframe';
+                                installSubframeRecorder({
+                                    sessionId: String(d.sessionId || ''),
+                                    tabId: String(d.tabId || ''),
+                                    expectedOrigin: myOrig,
+                                    frameSelector: window.__apexFrameSelector
+                                });
+                            } else if (d.type === 'APEX_FRAME_SCAN_REQ') {
+                                if (d.frameSelector) window.__apexFrameSelector = d.frameSelector;
+                                pushScanSnapshot();
+                            } else if (d.type === 'APEX_FRAME_EXEC_REQ') {
+                                var res = execStepInSubframe(d);
+                                window.top.postMessage({ type: 'APEX_FRAME_EXEC_RES', reqId: d.reqId, result: res }, '*');
+                            }
+                        } catch (_) {}
+                    });
+                    sendHello();
+                    document.addEventListener('DOMContentLoaded', function() { sendHello(); setTimeout(pushScanSnapshot, 60); });
+                    window.addEventListener('load', function() { sendHello(); setTimeout(pushScanSnapshot, 100); });
+                    ['focusin', 'pointerdown', 'input'].forEach(function(ev) {
+                        document.addEventListener(ev, function() {
+                            if (!window.__apexRecordingActive) sendHello();
+                        }, { capture: true, once: true });
+                    });
+                    var scanDeb = null;
+                    document.addEventListener('DOMContentLoaded', function() {
+                        if (typeof MutationObserver !== 'undefined' && document.documentElement) {
+                            new MutationObserver(function() {
+                                if (scanDeb) clearTimeout(scanDeb);
+                                scanDeb = setTimeout(pushScanSnapshot, 220);
+                            }).observe(document.documentElement, { childList: true, subtree: true });
+                        }
+                    });
+                } catch (_) {}
+            })();
+        """.trimIndent()
+    }
+
+    private fun buildRecorderCoreScript(
+        qSessionId: String,
+        qTabId: String,
+        qExpectedOrigin: String,
+        safeInitialSeq: Long,
+        subframeMode: Boolean,
+        frameSelectorExpr: String
+    ): String {
+        val subframeFlag = if (subframeMode) "true" else "false"
         return """
             (function() {
                 try {
@@ -771,7 +1164,15 @@ class AutomationEngine(
                                     ? el.parentElement.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea').length
                                     : 2;
                                 var pTxt = extractValidLabelText(prev, pCtrls > 1);
-                                if (pTxt) return pTxt;
+                                if (pTxt && !/^\+\d{1,4}$/.test(pTxt)) return pTxt;
+                            }
+                            var nextEl = el.nextElementSibling;
+                            if (nextEl) {
+                                var nCtrls = el.parentElement && el.parentElement.querySelectorAll
+                                    ? el.parentElement.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea').length
+                                    : 2;
+                                var nTxt = extractValidLabelText(nextEl, nCtrls > 1);
+                                if (nTxt && !/^\+\d{1,4}$/.test(nTxt)) return nTxt;
                             }
                             var cur = el.parentElement;
                             var depth = 0;
@@ -788,13 +1189,13 @@ class AutomationEngine(
                                         ? cur.parentElement.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea, [role="combobox"], [role="listbox"], [role="spinbutton"]')
                                         : [];
                                     var cpTxt = extractValidLabelText(curPrev, parentCtrls.length > 1);
-                                    if (cpTxt) return cpTxt;
+                                    if (cpTxt && !/^\+\d{1,4}$/.test(cpTxt)) return cpTxt;
                                 }
                                 if (ctrls.length <= 1 && cur.querySelector) {
                                     var innerLbl = cur.querySelector('label, [class*="label"], [class*="Label"]');
                                     if (innerLbl) {
                                         var ilTxt = extractValidLabelText(innerLbl, false);
-                                        if (ilTxt) return ilTxt;
+                                        if (ilTxt && !/^\+\d{1,4}$/.test(ilTxt)) return ilTxt;
                                     }
                                 }
                                 cur = cur.parentElement;
@@ -1314,6 +1715,7 @@ class AutomationEngine(
                         onFocusIn: null,
                         onFocusOut: null,
                         onInput: null,
+                        onCompositionEnd: null,
                         onChange: null,
                         onClick: null,
                         onDblClick: null,
@@ -1329,9 +1731,28 @@ class AutomationEngine(
                         onTouchEnd: null,
                         onMouseDown: null,
                         onMouseUp: null,
+                        onPageHide: null,
+                        onVisibilityChange: null,
+                        isSubframe: $subframeFlag,
+                        frameSelector: $frameSelectorExpr,
                         cleanup: function() {
                             inst.destroyed = true;
                             inst.active = false;
+                            if (!inst.isSubframe) {
+                                window.__apexRecorderConfig = { active: false, sessionId: inst.sessionId };
+                                try {
+                                    var cleanupFrames = document.querySelectorAll('iframe');
+                                    for (var cf = 0; cf < cleanupFrames.length; cf++) {
+                                        try {
+                                            cleanupFrames[cf].contentWindow && cleanupFrames[cf].contentWindow.postMessage({
+                                                type: 'APEX_RECORDER_SYNC',
+                                                active: false,
+                                                sessionId: inst.sessionId
+                                            }, '*');
+                                        } catch (_) {}
+                                    }
+                                } catch (_) {}
+                            }
                             if (inst.inputTimer) {
                                 try { clearTimeout(inst.inputTimer); } catch (_) {}
                                 inst.inputTimer = null;
@@ -1365,6 +1786,7 @@ class AutomationEngine(
                                 if (inst.onFocusIn) document.removeEventListener('focusin', inst.onFocusIn, true);
                                 if (inst.onFocusOut) document.removeEventListener('focusout', inst.onFocusOut, true);
                                 if (inst.onInput) document.removeEventListener('input', inst.onInput, true);
+                                if (inst.onCompositionEnd) document.removeEventListener('compositionend', inst.onCompositionEnd, true);
                                 if (inst.onChange) document.removeEventListener('change', inst.onChange, true);
                                 if (inst.onClick) document.removeEventListener('click', inst.onClick, true);
                                 if (inst.onDblClick) document.removeEventListener('dblclick', inst.onDblClick, true);
@@ -1386,6 +1808,8 @@ class AutomationEngine(
                                 }
                                 if (inst.onMouseDown) document.removeEventListener('mousedown', inst.onMouseDown, true);
                                 if (inst.onMouseUp) document.removeEventListener('mouseup', inst.onMouseUp, true);
+                                if (inst.onPageHide) window.removeEventListener('pagehide', inst.onPageHide, true);
+                                if (inst.onVisibilityChange) document.removeEventListener('visibilitychange', inst.onVisibilityChange, true);
                             } catch (_) {}
                             if (window.__apexRecorderInstance === inst) {
                                 window.__apexRecorderInstance = null;
@@ -1395,33 +1819,65 @@ class AutomationEngine(
                         }
                     };
 
+                    function allocSequence() {
+                        try {
+                            if (window.ApexAutomationBridge && typeof window.ApexAutomationBridge.allocateRecordedSequence === 'function') {
+                                var sharedSeq = Number(window.ApexAutomationBridge.allocateRecordedSequence(inst.sessionId));
+                                if (sharedSeq > 0) {
+                                    inst.seq = sharedSeq;
+                                    return sharedSeq;
+                                }
+                            }
+                        } catch (_) {}
+                        inst.seq = inst.seq + 1;
+                        return inst.seq;
+                    }
+
                     function emit(domEvent, actionType, label, el, value, isDestructive, isPasswordField, vaultSecret) {
                         if (inst.destroyed || !inst.active || window.__apexRecorderInstance !== inst) return;
                         var nowOrigin = getCanonicalOrigin();
-                        if (!nowOrigin || nowOrigin !== inst.expectedOrigin) {
+                        if (!nowOrigin || (!inst.isSubframe && nowOrigin !== inst.expectedOrigin)) {
                             inst.cleanup();
                             return;
                         }
                         if (domEvent && inst.lastDomEvent === domEvent) return;
                         inst.lastDomEvent = domEvent || null;
-                        inst.seq = inst.seq + 1;
+                        var nextSeq = allocSequence();
                         var isPwd = Boolean(isPasswordField);
                         if (el) highlightRecordedNode(el);
                         var bundle = el
                             ? buildLocatorBundle(el)
                             : { selector: '', candidates: [], matchCount: 1, contexts: { framePath: [], shadowHostPath: [] }, parentContext: '', nearbyText: '', relevantAttributes: {}, ambiguousCandidates: [] };
+                        var effectiveSelector = bundle.selector || '';
+                        var effectiveCandidates = bundle.candidates || [];
+                        var effectiveFramePath = bundle.contexts.framePath || [];
+                        if (inst.isSubframe && inst.frameSelector) {
+                            effectiveFramePath = [inst.frameSelector].concat(effectiveFramePath);
+                            if (effectiveSelector && effectiveSelector.indexOf('>>') < 0) {
+                                effectiveSelector = inst.frameSelector + ' >> ' + effectiveSelector;
+                            }
+                            effectiveCandidates = effectiveCandidates.map(function(c) {
+                                var cSel = c.selector || '';
+                                return Object.assign({}, c, {
+                                    strategy: 'iframe_chain',
+                                    scope: 'IFRAME',
+                                    selector: (cSel && cSel.indexOf('>>') < 0) ? (inst.frameSelector + ' >> ' + cSel) : cSel
+                                });
+                            });
+                        }
                         var rectObj = el ? getNodeRect(el) : null;
                         var payload = JSON.stringify({
                             sessionId: inst.sessionId,
                             tabId: inst.tabId,
                             origin: nowOrigin,
-                            sequenceNumber: inst.seq,
+                            isSubframe: Boolean(inst.isSubframe),
+                            sequenceNumber: nextSeq,
                             eventType: actionType,
                             targetLabel: label || 'Element',
                             tagName: (el && el.tagName ? el.tagName.toLowerCase() : ''),
-                            selector: bundle.selector || '',
-                            locatorCandidates: bundle.candidates || [],
-                            framePath: bundle.contexts.framePath || [],
+                            selector: effectiveSelector,
+                            locatorCandidates: effectiveCandidates,
+                            framePath: effectiveFramePath,
                             shadowHostPath: bundle.contexts.shadowHostPath || [],
                             parentContext: bundle.parentContext || '',
                             nearbyText: bundle.nearbyText || '',
@@ -1438,6 +1894,10 @@ class AutomationEngine(
                         });
                         if (window.ApexAutomationBridge && window.ApexAutomationBridge.onRecordedEventJson) {
                             window.ApexAutomationBridge.onRecordedEventJson(payload);
+                        } else if (inst.isSubframe && window.top) {
+                            try {
+                                window.top.postMessage({ type: 'APEX_RECORDER_EMIT', payloadJson: payload }, '*');
+                            } catch (_) {}
                         }
                     }
 
@@ -1549,6 +2009,28 @@ class AutomationEngine(
                                 cur = cur.parentElement;
                                 steps++;
                             }
+                            if (!el) {
+                                // Unwrap inert floating placeholder/wrapper spans inside a single-input container
+                                var rawTag = (rawTarget.tagName || '').toUpperCase();
+                                if (rawTag === 'SPAN' || rawTag === 'DIV' || rawTag === 'P' || rawTag === 'I' || rawTag === 'SVG' || rawTag === 'PATH') {
+                                    var wrapCur = rawTarget.parentElement;
+                                    var wrapDepth = 0;
+                                    while (wrapCur && wrapCur.nodeType === 1 && wrapDepth < 2) {
+                                        var wInputs = wrapCur.querySelectorAll
+                                            ? wrapCur.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="reset"]), textarea')
+                                            : [];
+                                        var wBtns = wrapCur.querySelectorAll
+                                            ? wrapCur.querySelectorAll('button, a[href], [role="button"], [role="link"]')
+                                            : [];
+                                        if (wInputs.length === 1 && wBtns.length === 0) {
+                                            el = wInputs[0];
+                                            break;
+                                        }
+                                        wrapCur = wrapCur.parentElement;
+                                        wrapDepth++;
+                                    }
+                                }
+                            }
                             if (!el) el = rawTarget;
                         }
                         if (!el || !el.tagName) return null;
@@ -1559,6 +2041,14 @@ class AutomationEngine(
                         }
                         if (el.tagName.toUpperCase() === 'HTML') return null;
                         return el;
+                    }
+
+                    function isExplicitPickerInput(el) {
+                        if (!el || !el.getAttribute) return false;
+                        return el.hasAttribute('data-datepicker') || el.hasAttribute('data-timepicker') ||
+                            el.hasAttribute('data-time-picker') || el.hasAttribute('data-calendar') ||
+                            el.hasAttribute('data-year-picker') || el.hasAttribute('data-birth-year') ||
+                            String(el.getAttribute('aria-haspopup') || '').toLowerCase() === 'dialog';
                     }
 
                     function isPickerTriggerEl(el) {
@@ -1643,6 +2133,9 @@ class AutomationEngine(
                         var rawTarget = resolveEventEl(e);
                         var el = resolveTapTarget(rawTarget);
                         if (!el) return;
+                        if (inst.pendingInput && inst.pendingInput.el && inst.pendingInput.el !== el && inst.pendingInput.el !== rawTarget) {
+                            flushPendingInput(null);
+                        }
                         cancelHoldTimer();
                         cancelPendingTap();
                         var cx = 0;
@@ -1799,7 +2292,7 @@ class AutomationEngine(
                             }
                             var tag = el.tagName.toUpperCase();
                             var role = (el.getAttribute && el.getAttribute('role') || '').toLowerCase();
-                            if (tag === 'INPUT' && (Boolean(el.readOnly) || isPickerTriggerEl(el))) {
+                            if (tag === 'INPUT' && (Boolean(el.readOnly) || isExplicitPickerInput(el))) {
                                 return;
                             }
                             var isEditableOrSelect = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' ||
@@ -1815,8 +2308,8 @@ class AutomationEngine(
                                     inst.lastFocusAt = Date.now();
                                     if (inst.lastFocusKey === focusKey) return;
                                     inst.lastFocusKey = focusKey;
-                                    var isTextFieldFocus = (tag === 'INPUT' || tag === 'TEXTAREA' || Boolean(el.isContentEditable)) &&
-                                        role !== 'combobox' && role !== 'listbox';
+                                    var isTextFieldFocus = (tag === 'INPUT' && !Boolean(el.readOnly)) ||
+                                        tag === 'TEXTAREA' || Boolean(el.isContentEditable);
                                     if (isTextFieldFocus) {
                                         var isPwdFocus = type === 'password' || isSensitiveNode(el);
                                         emit(e, 'INPUT', getLabel(el), el, '', false, isPwdFocus, '');
@@ -1854,7 +2347,33 @@ class AutomationEngine(
                             }
                             inst.inputTimer = setTimeout(function() {
                                 flushPendingInput(null);
-                            }, 220);
+                            }, 120);
+                        } catch (_) {}
+                    };
+
+                    inst.onCompositionEnd = function(e) {
+                        try {
+                            if (inst.destroyed || !inst.active) return;
+                            inst.onInput(e);
+                            flushPendingInput(null);
+                        } catch (_) {}
+                    };
+
+                    inst.onPageHide = function() {
+                        try {
+                            if (inst.destroyed || !inst.active) return;
+                            flushPendingInput(null);
+                            flushPendingScroll();
+                        } catch (_) {}
+                    };
+
+                    inst.onVisibilityChange = function() {
+                        try {
+                            if (inst.destroyed || !inst.active) return;
+                            if (document.visibilityState === 'hidden') {
+                                flushPendingInput(null);
+                                flushPendingScroll();
+                            }
                         } catch (_) {}
                     };
 
@@ -1899,7 +2418,10 @@ class AutomationEngine(
                                     false
                                 );
                             } else if (tag === 'SELECT') {
-                                emit(e, 'SELECT', getLabel(el), el, el.value || '', false, false);
+                                var selOpt = (el.options && el.selectedIndex >= 0) ? el.options[el.selectedIndex] : null;
+                                var selRawVal = String(el.value || '').trim();
+                                var selOptText = selOpt ? String(selOpt.text || selOpt.label || '').replace(/\s+/g, ' ').trim() : '';
+                                emit(e, 'SELECT', getLabel(el), el, selRawVal || selOptText, false, false);
                             } else if (tag === 'INPUT' || tag === 'TEXTAREA') {
                                 var isPwd = type === 'password' || isSensitiveNode(el);
                                 var fullInputVal = String(el.value || '').slice(0, 256);
@@ -1982,10 +2504,26 @@ class AutomationEngine(
                                 }
                             }
 
-                            // Avoid duplicate CLICK right after initial focusin SELECT on editable text/select fields (but allow readonly triggers)
+                            // Avoid duplicate CLICK right after initial focusin SELECT on editable text/select/combobox fields (but allow readonly triggers)
+                            var isSelectOrComboRole = tag === 'SELECT' || role === 'combobox' || role === 'listbox';
+                            if (isSelectOrComboRole && inst.lastFocusEl === el && (Date.now() - inst.lastFocusAt) < 150) {
+                                return;
+                            }
                             var isTextOrSelectField = (tag === 'INPUT' && type !== 'submit' && type !== 'button' && type !== 'reset' && type !== 'range' && type !== 'color') ||
                                 tag === 'TEXTAREA' || tag === 'SELECT' || Boolean(el.isContentEditable);
                             if (isTextOrSelectField && !Boolean(el.readOnly) && !isPickerTriggerEl(el) && inst.lastFocusEl === el && (Date.now() - inst.lastFocusAt) < 150) {
+                                return;
+                            }
+                            if (isTextOrSelectField && !Boolean(el.readOnly) && (tag === 'INPUT' || tag === 'TEXTAREA' || Boolean(el.isContentEditable)) && !isExplicitPickerInput(el)) {
+                                var isPwdClick = type === 'password' || isSensitiveNode(el);
+                                var curInputVal = isPwdClick ? '' : ((tag === 'INPUT' || tag === 'TEXTAREA') ? String(el.value || '') : String(el.innerText || el.textContent || '')).slice(0, 256);
+                                var rawPwdClickVal = isPwdClick ? String(el.value || '').slice(0, 256) : '';
+                                if (!(inst.lastFocusEl === el && (Date.now() - inst.lastFocusAt) < 400) &&
+                                    !(inst.lastEmittedInput && inst.lastEmittedInput.el === el)) {
+                                    inst.lastFocusEl = el;
+                                    inst.lastFocusAt = Date.now();
+                                    emit(e, 'INPUT', getLabel(el), el, curInputVal, false, isPwdClick, rawPwdClickVal);
+                                }
                                 return;
                             }
 
@@ -2082,9 +2620,18 @@ class AutomationEngine(
                     window.__apexRecorderInstance = inst;
                     window.__apexRecordingActive = true;
                     window.__apexRecorderInstalled = true;
+                    if (!inst.isSubframe) {
+                        window.__apexRecorderConfig = {
+                            active: true,
+                            sessionId: inst.sessionId,
+                            tabId: inst.tabId,
+                            expectedOrigin: inst.expectedOrigin
+                        };
+                    }
                     document.addEventListener('focusin', inst.onFocusIn, true);
                     document.addEventListener('focusout', inst.onFocusOut, true);
                     document.addEventListener('input', inst.onInput, true);
+                    document.addEventListener('compositionend', inst.onCompositionEnd, true);
                     document.addEventListener('change', inst.onChange, true);
                     document.addEventListener('click', inst.onClick, true);
                     document.addEventListener('dblclick', inst.onDblClick, true);
@@ -2102,19 +2649,39 @@ class AutomationEngine(
                     document.addEventListener('touchcancel', inst.onTouchEnd, true);
                     document.addEventListener('mousedown', inst.onMouseDown, true);
                     document.addEventListener('mouseup', inst.onMouseUp, true);
+                    window.addEventListener('pagehide', inst.onPageHide, true);
+                    document.addEventListener('visibilitychange', inst.onVisibilityChange, true);
 
                     var attachedSet = typeof WeakSet !== 'undefined' ? new WeakSet() : null;
+                    function syncIframeWindow(frm, frmIndex) {
+                        if (inst.isSubframe || !frm || inst.destroyed) return;
+                        try {
+                            var cw = frm.contentWindow;
+                            if (!cw) return;
+                            var fid = frm.id || '';
+                            var fname = frm.getAttribute && frm.getAttribute('name') || '';
+                            var fSel = isStableId(fid) ? ('iframe#' + escCss(fid)) :
+                                (fname ? ('iframe[name="' + escAttr(fname) + '"]') :
+                                (typeof frmIndex === 'number' && frmIndex > 0 ? ('iframe:nth-of-type(' + (frmIndex + 1) + ')') : 'iframe'));
+                            cw.postMessage({
+                                type: 'APEX_RECORDER_SYNC',
+                                active: true,
+                                sessionId: inst.sessionId,
+                                tabId: inst.tabId,
+                                expectedOrigin: inst.expectedOrigin,
+                                frameSelector: fSel
+                            }, '*');
+                        } catch (_) {}
+                    }
                     function attachSubRootListeners(targetRoot, isFrameDoc, depth) {
                         if (!targetRoot || inst.destroyed || depth > 4) return;
                         if (attachedSet) {
                             if (attachedSet.has(targetRoot)) return;
                             attachedSet.add(targetRoot);
                         }
-                        var evNames = isFrameDoc
-                            ? ['focusin', 'focusout', 'input', 'change', 'click', 'dblclick', 'contextmenu', 'keydown', 'scroll', 'submit', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove', 'touchend', 'touchcancel', 'mousedown', 'mouseup']
-                            : ['focusin', 'focusout', 'change', 'scroll', 'submit'];
+                        var evNames = ['focusin', 'focusout', 'input', 'compositionend', 'change', 'click', 'dblclick', 'contextmenu', 'keydown', 'scroll', 'submit', 'pointerdown', 'pointermove', 'pointerup', 'pointercancel', 'touchstart', 'touchmove', 'touchend', 'touchcancel', 'mousedown', 'mouseup'];
                         var handlerMap = {
-                            focusin: inst.onFocusIn, focusout: inst.onFocusOut, input: inst.onInput, change: inst.onChange,
+                            focusin: inst.onFocusIn, focusout: inst.onFocusOut, input: inst.onInput, compositionend: inst.onCompositionEnd, change: inst.onChange,
                             click: inst.onClick, dblclick: inst.onDblClick, contextmenu: inst.onContextMenu,
                             keydown: inst.onKeyDown, scroll: inst.onScroll, submit: inst.onSubmit,
                             pointerdown: inst.onPointerDown, pointermove: inst.onPointerMove, pointerup: inst.onPointerUp,
@@ -2131,37 +2698,44 @@ class AutomationEngine(
                         });
                         scanNestedRoots(targetRoot, depth);
                     }
+                    function hookIframeElement(frm, depth, frmIdx) {
+                        if (!frm || inst.destroyed || depth > 4) return;
+                        try {
+                            var fDoc = frm.contentDocument;
+                            if (fDoc && fDoc.documentElement) {
+                                attachSubRootListeners(fDoc, true, depth + 1);
+                            }
+                        } catch (_) {}
+                        syncIframeWindow(frm, frmIdx);
+                        if (!frm.__apexFrameHooked) {
+                            frm.__apexFrameHooked = true;
+                            var onFrmLoad = function() {
+                                try {
+                                    if (!inst.destroyed && frm.contentDocument) {
+                                        attachSubRootListeners(frm.contentDocument, true, depth + 1);
+                                    }
+                                    syncIframeWindow(frm, frmIdx);
+                                } catch (_) {}
+                            };
+                            frm.addEventListener('load', onFrmLoad);
+                            inst.subRootCleanups.push(function() {
+                                try { frm.removeEventListener('load', onFrmLoad); } catch (_) {}
+                            });
+                        }
+                    }
                     function scanNestedRoots(rootNode, depth) {
                         if (!rootNode || !rootNode.querySelectorAll || depth > 4 || inst.destroyed) return;
                         try {
                             var allNodes = rootNode.querySelectorAll('*');
                             var cap = Math.min(allNodes.length, 400);
+                            var fIdx = 0;
                             for (var i = 0; i < cap; i++) {
                                 var n = allNodes[i];
                                 if (n.shadowRoot) {
                                     attachSubRootListeners(n.shadowRoot, false, depth + 1);
                                 }
                                 if ((n.tagName || '').toLowerCase() === 'iframe') {
-                                    try {
-                                        var fDoc = n.contentDocument;
-                                        if (fDoc && fDoc.documentElement) {
-                                            attachSubRootListeners(fDoc, true, depth + 1);
-                                        }
-                                        if (!n.__apexFrameHooked) {
-                                            n.__apexFrameHooked = true;
-                                            var onFrmLoad = function() {
-                                                try {
-                                                    if (!inst.destroyed && n.contentDocument) {
-                                                        attachSubRootListeners(n.contentDocument, true, depth + 1);
-                                                    }
-                                                } catch (_) {}
-                                            };
-                                            n.addEventListener('load', onFrmLoad);
-                                            inst.subRootCleanups.push(function() {
-                                                try { n.removeEventListener('load', onFrmLoad); } catch (_) {}
-                                            });
-                                        }
-                                    } catch (_) {}
+                                    hookIframeElement(n, depth, fIdx++);
                                 }
                             }
                         } catch (_) {}
@@ -2179,9 +2753,7 @@ class AutomationEngine(
                                             if (an && an.nodeType === 1) {
                                                 if (an.shadowRoot) attachSubRootListeners(an.shadowRoot, false, 1);
                                                 if ((an.tagName || '').toLowerCase() === 'iframe') {
-                                                    try {
-                                                        if (an.contentDocument) attachSubRootListeners(an.contentDocument, true, 1);
-                                                    } catch (_) {}
+                                                    hookIframeElement(an, 1, 0);
                                                 }
                                                 scanNestedRoots(an, 1);
                                             }
@@ -3304,19 +3876,63 @@ class AutomationEngine(
                     errorCode = AutomationErrorCode.JS_EXCEPTION
                 )
                 is JsEvalResult.Success -> {
-                    val isPendingDynamic = runCatching {
+                    val parsedControl = runCatching {
                         val raw = evalResult.rawValue
                         val unquoted = if (raw.startsWith("\"") && raw.endsWith("\"")) {
                             JSONTokener(raw).nextValue().toString()
                         } else {
                             raw
                         }
-                        JSONObject(unquoted).optBoolean("pendingDynamic", false)
-                    }.getOrDefault(false)
+                        JSONObject(unquoted)
+                    }.getOrNull()
+                    val isPendingDynamic = parsedControl?.optBoolean("pendingDynamic", false) == true
+                    val isPendingFrameExec = parsedControl?.optBoolean("pendingFrameExec", false) == true
+                    val frameExecReqId = parsedControl?.optString("frameExecReqId", "").orEmpty()
                     if (isPendingDynamic && dynamicAttempt < 12) {
                         dynamicAttempt++
                         delay(50L)
                         continue
+                    }
+                    if (isPendingFrameExec && frameExecReqId.isNotBlank()) {
+                        var frameAttempt = 0
+                        var frameRawResponse: String? = null
+                        val pollScript = """
+                            (function() {
+                                try {
+                                    var r = window.__apexFrameExecResults && window.__apexFrameExecResults[${JSONObject.quote(frameExecReqId)}];
+                                    if (!r) return JSON.stringify({ pending: true });
+                                    delete window.__apexFrameExecResults[${JSONObject.quote(frameExecReqId)}];
+                                    return JSON.stringify(r);
+                                } catch (e) {
+                                    return JSON.stringify({ ok: false, code: 'JS_EXCEPTION', msg: String(e && e.message || e) });
+                                }
+                            })();
+                        """.trimIndent()
+                        while (frameAttempt < 16) {
+                            delay(50L)
+                            val pollRes = evalJsWithResult(webView, pollScript, timeoutMs = effectiveTimeout)
+                            if (pollRes is JsEvalResult.Success) {
+                                val pollObj = parseEvalJsonObject(pollRes.rawValue)
+                                if (pollObj != null && !pollObj.optBoolean("pending", false)) {
+                                    frameRawResponse = pollObj.toString()
+                                    break
+                                }
+                            }
+                            frameAttempt++
+                        }
+                        val finalRaw = frameRawResponse ?: JSONObject().apply {
+                            put("ok", false)
+                            put("code", "JS_TIMEOUT")
+                            put("msg", "Timed out waiting for bridged same-site iframe execution.")
+                        }.toString()
+                        val frameOutcome = parseStepJsonResponse(finalRaw, effectiveStep)
+                        return if (!resolvedVaultSecret.isNullOrEmpty() && isSensitiveStepDescriptor(step)) {
+                            frameOutcome.copy(
+                                message = frameOutcome.message.replace(resolvedVaultSecret, "••••")
+                            )
+                        } else {
+                            frameOutcome
+                        }
                     }
                     val rawOutcome = parseStepJsonResponse(evalResult.rawValue, effectiveStep)
                     return if (!resolvedVaultSecret.isNullOrEmpty() && isSensitiveStepDescriptor(step)) {
@@ -3604,7 +4220,28 @@ class AutomationEngine(
         navigationSynchronizer: TabNavigationSynchronizer?,
         lifecycleController: ExecutionLifecycleController? = null
     ): StepExecutionResult {
-        val wv = webViewProvider() ?: return StepExecutionResult(true, "DOM check skipped (no WebView)")
+        var mountedWebView = webViewProvider()
+        if (mountedWebView == null && tabId.isNotEmpty() && navigationSynchronizer != null) {
+            val mountDeadline = System.currentTimeMillis() + minOf(domReadyTimeoutMs, 1_500L)
+            val pollStepMs = domStabilityPollMs.coerceAtLeast(25L)
+            while (mountedWebView == null && System.currentTimeMillis() < mountDeadline) {
+                coroutineContext.ensureActive()
+                if (lifecycleController != null) {
+                    lifecycleController.awaitRunnableOrAbort()?.let { abort ->
+                        return StepExecutionResult(
+                            success = false,
+                            message = abort.message,
+                            errorCode = abort.code
+                        )
+                    }
+                    lifecycleController.interruptibleDelay(pollStepMs)
+                } else {
+                    delay(pollStepMs)
+                }
+                mountedWebView = webViewProvider()
+            }
+        }
+        val wv = mountedWebView ?: return StepExecutionResult(true, "DOM check skipped (no WebView)")
         val needsTargetPresence = nextStep != null &&
             nextStep.actionType != AutomationActionType.NAVIGATE &&
             nextStep.actionType != AutomationActionType.SCROLL &&

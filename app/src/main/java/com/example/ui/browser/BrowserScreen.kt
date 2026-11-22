@@ -67,6 +67,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FloatingActionButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -82,6 +83,7 @@ import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.windowsizeclass.WindowSizeClass
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
@@ -94,6 +96,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
@@ -110,6 +119,7 @@ import com.example.R
 import com.example.SubscriptionActivity
 import com.example.data.preferences.BrowserPreferences
 import com.example.data.preferences.DownloadLocationMode
+import com.example.devtools.DevToolsDockMode
 import com.example.engine.DefaultBrowserHelper
 import com.example.engine.DownloadStorageHelper
 import com.example.engine.FastDownloadEngine
@@ -371,7 +381,8 @@ fun BrowserScreen(
             !uiState.isSearchScreenOpen &&
             !uiState.isMenuSheetOpen &&
             !uiState.isAutomationHudOpen &&
-            !uiState.isAutomationOpen
+            !uiState.isAutomationOpen &&
+            !uiState.devTools.isOpen
     ) {
         viewModel.navigateBack()
     }
@@ -387,15 +398,31 @@ fun BrowserScreen(
         uiState.isPasswordManagerOpen ||
         uiState.isTabSwitcherOpen
 
-    val showBottomBar = uiState.isBottomBarVisible ||
-        activeTab.isHomePage ||
-        isAnyFullScreenOverlayOpen ||
-        uiState.isMenuSheetOpen ||
-        uiState.isFindInPageOpen ||
-        uiState.isAutomationHudOpen ||
-        uiState.isAutomationOpen
+    val showBottomBar = !uiState.devTools.isOpen && (
+        uiState.isBottomBarVisible ||
+            activeTab.isHomePage ||
+            isAnyFullScreenOverlayOpen ||
+            uiState.isMenuSheetOpen ||
+            uiState.isFindInPageOpen ||
+            uiState.isAutomationHudOpen ||
+            uiState.isAutomationOpen
+        )
 
-    Box(modifier = modifier.fillMaxSize()) {
+    Box(
+        modifier = modifier
+            .fillMaxSize()
+            .onPreviewKeyEvent { keyEvent ->
+                if (keyEvent.type == KeyEventType.KeyDown &&
+                    (keyEvent.key == Key.F12 ||
+                        (keyEvent.key == Key.I && keyEvent.isCtrlPressed && keyEvent.isShiftPressed))
+                ) {
+                    viewModel.toggleDevTools(isWideScreen = isWideScreen)
+                    true
+                } else {
+                    false
+                }
+            }
+    ) {
         Scaffold(
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
             topBar = {
@@ -425,7 +452,9 @@ fun BrowserScreen(
                             activeTabId = uiState.activeTabId,
                             onSelectTab = viewModel::selectTab,
                             onCloseTab = viewModel::closeTab,
-                            onNewTab = { viewModel.createNewTab() }
+                            onNewTab = { viewModel.createNewTab() },
+                            onOpenDevTools = { viewModel.toggleDevTools(isWideScreen = isWideScreen) },
+                            isDevToolsOpen = uiState.devTools.isOpen
                         )
                     }
                 }
@@ -437,13 +466,15 @@ fun BrowserScreen(
                     .fillMaxSize()
                     .padding(innerPadding)
             ) {
-                Row(modifier = Modifier.fillMaxSize()) {
-                    // Main Browser Content Area with tear-free Tab Switching
-                    Box(
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxHeight()
-                    ) {
+                val effectiveDevToolsDockMode = when {
+                    !uiState.devTools.isOpen -> null
+                    uiState.devTools.dockMode == DevToolsDockMode.SIDE_RIGHT && !isWideScreen ->
+                        DevToolsDockMode.COMPACT_BOTTOM
+                    else -> uiState.devTools.dockMode
+                }
+
+                val browserViewportContent: @Composable (Modifier) -> Unit = { viewportModifier ->
+                    Box(modifier = viewportModifier) {
                         androidx.compose.runtime.key(activeTab.id) {
                             val currentTab = activeTab
                             if (currentTab.isHomePage) {
@@ -541,6 +572,13 @@ fun BrowserScreen(
                                     onFindNextMatch = { viewModel.findNextInPage(forward = true) },
                                     onFindPreviousMatch = { viewModel.findNextInPage(forward = false) },
                                     onCloseFindInPage = viewModel::closeFindInPage,
+                                    onDevToolsConsoleMessage = viewModel::onDevToolsConsoleMessage,
+                                    onDevToolsNetworkRequest = viewModel::onDevToolsNetworkRequest,
+                                    onDevToolsNetworkError = viewModel::onDevToolsNetworkError,
+                                    onDevToolsElementPicked = viewModel::onDevToolsElementPicked,
+                                    onToggleDevToolsShortcut = { viewModel.toggleDevTools(isWideScreen = isWideScreen) },
+                                    multiFrameBridgeScript = remember(viewModel) { viewModel.buildMultiFrameBridgeScript() },
+                                    onAllocateRecordingSequence = viewModel::allocateRecordingSequence,
                                     canCapturePreview = !isAnyFullScreenOverlayOpen &&
                                         !uiState.isMenuSheetOpen &&
                                         !uiState.isFindInPageOpen &&
@@ -548,11 +586,102 @@ fun BrowserScreen(
                                         !uiState.isAutomationVaultOpen &&
                                         !uiState.isAutomationOpen &&
                                         !uiState.isSyncBackupDialogOpen &&
+                                        !(uiState.devTools.isOpen && uiState.devTools.dockMode == DevToolsDockMode.EXPANDED) &&
                                         uiState.editingGroup == null &&
                                         uiState.pendingCredentialReplayAuth == null,
                                     onThumbnailCaptured = viewModel::updateTabThumbnail
                                 )
                             }
+                        }
+                    }
+                }
+
+                val devToolsPanelContent: @Composable (Modifier) -> Unit = { panelModifier ->
+                    DevToolsPanel(
+                        devToolsState = uiState.devTools,
+                        activePageUrl = activeTab.url,
+                        isHomePage = activeTab.isHomePage,
+                        isWideScreen = isWideScreen,
+                        isDesktopMode = preferences.desktopViewportEnabled,
+                        onSelectTab = viewModel::selectDevToolsTab,
+                        onCycleDockMode = { viewModel.cycleDevToolsDockMode(isWideScreen = isWideScreen) },
+                        onToggleInspectElementMode = viewModel::toggleDevToolsInspectElementMode,
+                        onToggleLayoutOutlines = viewModel::toggleDevToolsLayoutOutlines,
+                        onRefreshCurrentTab = viewModel::refreshDevToolsActiveTabData,
+                        onHardReloadPage = viewModel::hardReloadActiveTab,
+                        onClose = viewModel::closeDevTools,
+                        onConsoleInputChange = viewModel::updateDevToolsConsoleInput,
+                        onRunConsoleExpression = viewModel::evaluateDevToolsConsole,
+                        onSelectConsoleFilter = viewModel::setDevToolsConsoleFilter,
+                        onClearConsole = viewModel::clearDevToolsConsole,
+                        onDomSearchChange = viewModel::setDevToolsDomSearch,
+                        onRefreshDom = viewModel::refreshDevToolsDom,
+                        onSelectDomNode = viewModel::selectDevToolsDomNode,
+                        onNetworkSearchChange = viewModel::setDevToolsNetworkSearch,
+                        onToggleNetworkFlaggedOnly = viewModel::toggleDevToolsNetworkFlaggedOnly,
+                        onSyncNetworkTiming = viewModel::syncDevToolsNetworkPerformance,
+                        onClearNetwork = viewModel::clearDevToolsNetwork,
+                        onRefreshStorage = viewModel::refreshDevToolsStorage,
+                        onSetStorageItem = viewModel::setDevToolsStorageItem,
+                        onDeleteStorageItem = viewModel::deleteDevToolsStorageItem,
+                        onClearStorage = viewModel::clearDevToolsStorage,
+                        onClearCookies = viewModel::clearDevToolsCookies,
+                        onToggleDesktopMode = viewModel::toggleDesktopViewport,
+                        modifier = panelModifier
+                    )
+                }
+
+                when (effectiveDevToolsDockMode) {
+                    DevToolsDockMode.SIDE_RIGHT -> {
+                        Row(modifier = Modifier.fillMaxSize()) {
+                            browserViewportContent(
+                                Modifier
+                                    .weight(0.54f)
+                                    .fillMaxHeight()
+                            )
+                            VerticalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            devToolsPanelContent(
+                                Modifier
+                                    .weight(0.46f)
+                                    .fillMaxHeight()
+                            )
+                        }
+                    }
+
+                    DevToolsDockMode.COMPACT_BOTTOM -> {
+                        Column(modifier = Modifier.fillMaxSize()) {
+                            browserViewportContent(
+                                Modifier
+                                    .weight(0.48f)
+                                    .fillMaxWidth()
+                            )
+                            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                            devToolsPanelContent(
+                                Modifier
+                                    .weight(0.52f)
+                                    .fillMaxWidth()
+                            )
+                        }
+                    }
+
+                    DevToolsDockMode.EXPANDED -> {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            browserViewportContent(Modifier.fillMaxSize())
+                            devToolsPanelContent(
+                                Modifier
+                                    .fillMaxSize()
+                                    .zIndex(2f)
+                            )
+                        }
+                    }
+
+                    null -> {
+                        Row(modifier = Modifier.fillMaxSize()) {
+                            browserViewportContent(
+                                Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                            )
                         }
                     }
                 }
@@ -1439,6 +1568,7 @@ fun BrowserScreen(
                 onOpenPasswordsClick = { viewModel.setPasswordManagerOpen(true) },
                 onReloadPageClick = viewModel::reloadActiveTab,
                 onToggleDesktopMode = viewModel::toggleDesktopViewport,
+                onOpenDevToolsClick = { viewModel.openDevTools(isWideScreen = isWideScreen) },
                 onClearBrowsingData = viewModel::resetPrivacyStats,
                 onDismiss = { viewModel.setMenuSheetOpen(false) }
             )

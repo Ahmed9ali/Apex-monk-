@@ -66,7 +66,7 @@ class PerformanceOptimizer {
 
         CookieManager.getInstance().apply {
             setAcceptCookie(true)
-            setAcceptThirdPartyCookies(webView, false) // Privacy-by-default: block 3P cookies
+            setAcceptThirdPartyCookies(webView, !isIncognito)
         }
 
         val desiredJsEnabled = !scriptGuardEnabled

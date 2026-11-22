@@ -602,7 +602,8 @@ data class RecordedDomEvent(
     val ambiguousCandidates: List<AmbiguousCandidateInfo> = emptyList(),
     val tagName: String = "",
     val boundingBox: ElementBoundingBox? = null,
-    val sensitiveCapturedValue: String = ""
+    val sensitiveCapturedValue: String = "",
+    val isSubframe: Boolean = false
 )
 
 data class RecorderLifecycleResult(

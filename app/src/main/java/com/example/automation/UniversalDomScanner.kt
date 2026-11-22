@@ -1132,7 +1132,14 @@ class UniversalDomScanner(
             return null
         }
         if (payloadTabId.isEmpty() || payloadTabId != sourceTabId) return null
-        if (session.expectedOrigin.isNotEmpty() && payloadOrigin.isNotEmpty() && payloadOrigin != session.expectedOrigin) {
+        val isSubframe = obj.optBoolean("isSubframe", false)
+        val isAllowedSubframeOrigin = isSubframe &&
+            session.expectedOrigin.isNotEmpty() &&
+            payloadOrigin.isNotEmpty() &&
+            automationEngine.areSameSiteOrigins(payloadOrigin, session.expectedOrigin)
+        if (session.expectedOrigin.isNotEmpty() && payloadOrigin.isNotEmpty() &&
+            payloadOrigin != session.expectedOrigin && !isAllowedSubframeOrigin
+        ) {
             return null
         }
         if (liveWebViewUrl.isNotBlank() && session.expectedOrigin.isNotEmpty()) {
@@ -2701,6 +2708,49 @@ class UniversalDomScanner(
                             return '';
                         }
                     }
+                    function getRegistrableSite(originStr) {
+                        try {
+                            if (!originStr) return '';
+                            const parts = String(originStr).split('://');
+                            if (parts.length !== 2) return '';
+                            const scheme = parts[0];
+                            const hp = parts[1].split(':');
+                            const host = hp[0];
+                            const port = hp[1] || '';
+                            if (!host) return '';
+                            if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return scheme + '://' + host + ':' + port;
+                            const labels = host.split('.').filter(Boolean);
+                            if (labels.length <= 2) return scheme + '://' + host + ':' + port;
+                            const sld = labels[labels.length - 2];
+                            const tld = labels[labels.length - 1];
+                            const multi = { co:1, com:1, org:1, net:1, edu:1, gov:1, mil:1, ac:1, ne:1, or:1, go:1 };
+                            const site = (tld.length === 2 && multi[sld] && labels.length >= 3)
+                                ? labels.slice(-3).join('.')
+                                : labels.slice(-2).join('.');
+                            return scheme + '://' + site + ':' + port;
+                        } catch (_) { return ''; }
+                    }
+                    function areSameSiteOrigins(o1, o2) {
+                        if (!o1 || !o2) return false;
+                        if (o1 === o2) return true;
+                        const s1 = getRegistrableSite(o1);
+                        const s2 = getRegistrableSite(o2);
+                        return Boolean(s1 && s1 === s2);
+                    }
+                    function parseUrlToCanonicalOrigin(rawUrl, baseHref) {
+                        try {
+                            if (!rawUrl) return '';
+                            const u = new URL(String(rawUrl), baseHref || window.location.href);
+                            const proto = String(u.protocol || '').toLowerCase();
+                            if (proto !== 'http:' && proto !== 'https:') return '';
+                            const scheme = proto.slice(0, -1);
+                            const host = String(u.hostname || '').trim().replace(/\.+$/, '').toLowerCase();
+                            if (!host) return '';
+                            const port = u.port ? parseInt(u.port, 10) : (scheme === 'http' ? 80 : 443);
+                            if (!port || isNaN(port) || port < 1 || port > 65535) return '';
+                            return scheme + '://' + host + ':' + port;
+                        } catch (_) { return ''; }
+                    }
 
                     const actualOrigin = getCanonicalOrigin(window);
                     if (EXPECTED_ORIGIN && actualOrigin && actualOrigin !== EXPECTED_ORIGIN) {
@@ -4014,9 +4064,11 @@ class UniversalDomScanner(
                                 const isOpaqueSandbox = sandboxAttr !== null && sandboxAttr.toLowerCase().indexOf('allow-same-origin') < 0;
                                 const frameSel = (el.id && isStableId(el.id)) ? ('iframe#' + escCss(el.id))
                                     : (el.name ? 'iframe[name="' + escAttr(el.name) + '"]' : 'iframe');
+                                const fullFramePath = frameChain.concat([frameSel]);
+                                const fullFramePathStr = fullFramePath.join(' >> ');
                                 if (iframeDepth >= MAX_IFRAME_DEPTH) {
                                     inaccessibleFramesOut.push({
-                                        framePath: frameChain.concat([frameSel]).join(' >> '),
+                                        framePath: fullFramePathStr,
                                         frameSrc: src,
                                         frameOrigin: '',
                                         reason: 'max-depth'
@@ -4025,38 +4077,70 @@ class UniversalDomScanner(
                                 }
                                 if (isOpaqueSandbox) {
                                     inaccessibleFramesOut.push({
-                                        framePath: frameChain.concat([frameSel]).join(' >> '),
+                                        framePath: fullFramePathStr,
                                         frameSrc: src,
                                         frameOrigin: '',
                                         reason: 'sandboxed'
                                     });
                                     continue;
                                 }
+                                function collectBridgedSameSiteFrame(candOrigin) {
+                                    if (!actualOrigin || !candOrigin || !areSameSiteOrigins(actualOrigin, candOrigin)) {
+                                        return false;
+                                    }
+                                    try {
+                                        if (el.contentWindow) {
+                                            el.contentWindow.postMessage({
+                                                type: 'APEX_FRAME_SCAN_REQ',
+                                                frameSelector: fullFramePathStr
+                                            }, '*');
+                                        }
+                                    } catch (_) {}
+                                    const cache = window.__apexSubframeScanCache && (
+                                        window.__apexSubframeScanCache[fullFramePathStr] ||
+                                        window.__apexSubframeScanCache[frameSel]
+                                    );
+                                    if (cache && Array.isArray(cache.elements)) {
+                                        for (let ci = 0; ci < cache.elements.length && elementsOut.length < MAX_ELEMENTS; ci++) {
+                                            const subEl = Object.assign({}, cache.elements[ci], {
+                                                framePath: fullFramePath,
+                                                frameOrigin: cache.frameOrigin || candOrigin
+                                            });
+                                            elementsOut.push(subEl);
+                                        }
+                                    }
+                                    return true;
+                                }
                                 try {
                                     const subDoc = el.contentDocument || (el.contentWindow && el.contentWindow.document);
                                     const subWin = el.contentWindow;
                                     if (!subDoc || !subDoc.documentElement) {
-                                        inaccessibleFramesOut.push({
-                                            framePath: frameChain.concat([frameSel]).join(' >> '),
-                                            frameSrc: src,
-                                            frameOrigin: '',
-                                            reason: 'unloaded'
-                                        });
+                                        const candOrig = parseUrlToCanonicalOrigin(src, baseUrl || window.location.href);
+                                        if (!collectBridgedSameSiteFrame(candOrig)) {
+                                            inaccessibleFramesOut.push({
+                                                framePath: fullFramePathStr,
+                                                frameSrc: src,
+                                                frameOrigin: candOrig || '',
+                                                reason: candOrig && actualOrigin && candOrig !== actualOrigin ? 'cross-origin' : 'unloaded'
+                                            });
+                                        }
                                     } else {
                                         const subOrigin = getCanonicalOrigin(subWin) || actualOrigin;
                                         if (actualOrigin && subOrigin && subOrigin !== actualOrigin) {
-                                            inaccessibleFramesOut.push({
-                                                framePath: frameChain.concat([frameSel]).join(' >> '),
-                                                frameSrc: src,
-                                                frameOrigin: subOrigin,
-                                                reason: 'cross-origin'
-                                            });
+                                            if (!collectBridgedSameSiteFrame(subOrigin)) {
+                                                inaccessibleFramesOut.push({
+                                                    framePath: fullFramePathStr,
+                                                    frameSrc: src,
+                                                    frameOrigin: subOrigin,
+                                                    reason: 'cross-origin'
+                                                });
+                                            }
                                         } else {
                                             scanRoot(
                                                 subDoc,
                                                 subDoc,
                                                 subWin || win,
-                                                frameChain.concat([frameSel]),
+                                                fullFramePath,
                                                 [],
                                                 String(subDoc.URL || src || ''),
                                                 subOrigin,
@@ -4066,12 +4150,15 @@ class UniversalDomScanner(
                                         }
                                     }
                                 } catch (_) {
-                                    inaccessibleFramesOut.push({
-                                        framePath: frameChain.concat([frameSel]).join(' >> '),
-                                        frameSrc: src,
-                                        frameOrigin: '',
-                                        reason: isOpaqueSandbox ? 'sandboxed' : 'cross-origin'
-                                    });
+                                    const candOrig = parseUrlToCanonicalOrigin(src, baseUrl || window.location.href);
+                                    if (!collectBridgedSameSiteFrame(candOrig)) {
+                                        inaccessibleFramesOut.push({
+                                            framePath: fullFramePathStr,
+                                            frameSrc: src,
+                                            frameOrigin: '',
+                                            reason: isOpaqueSandbox ? 'sandboxed' : 'cross-origin'
+                                        });
+                                    }
                                 }
                                 continue;
                             }
@@ -4473,7 +4560,17 @@ class UniversalDomScanner(
                                     const prevTag = (el.previousElementSibling.tagName || '').toLowerCase();
                                     const prevCls = String(el.previousElementSibling.className || '').toLowerCase();
                                     if (prevTag === 'label' || prevTag === 'dt' || prevTag === 'th' || prevCls.indexOf('label') >= 0) {
-                                        explicitLbl = (el.previousElementSibling.innerText || el.previousElementSibling.textContent || '').replace(/\s+/g, ' ').trim();
+                                        const prevTxt = (el.previousElementSibling.innerText || el.previousElementSibling.textContent || '').replace(/\s+/g, ' ').trim();
+                                        if (prevTxt && !/^\+\d{1,4}$/.test(prevTxt)) explicitLbl = prevTxt;
+                                    }
+                                }
+                                if (!explicitLbl && el.nextElementSibling) {
+                                    const nextTag = (el.nextElementSibling.tagName || '').toLowerCase();
+                                    if (nextTag === 'label' || nextTag === 'span' || nextTag === 'div' || nextTag === 'p') {
+                                        const nextTxt = (el.nextElementSibling.innerText || el.nextElementSibling.textContent || '').replace(/\s+/g, ' ').trim();
+                                        if (nextTxt && nextTxt.length <= 48 && !/^\+\d{1,4}$/.test(nextTxt)) {
+                                            explicitLbl = nextTxt;
+                                        }
                                     }
                                 }
                                 if (!explicitLbl && el.closest) {

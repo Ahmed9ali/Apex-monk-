@@ -40,6 +40,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.FolderCopy
 import androidx.compose.material.icons.filled.GridView
@@ -128,6 +129,8 @@ fun ExpressiveHorizontalTabStrip(
     onSelectTab: (String) -> Unit,
     onCloseTab: (String) -> Unit,
     onNewTab: () -> Unit,
+    onOpenDevTools: (() -> Unit)? = null,
+    isDevToolsOpen: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -238,6 +241,43 @@ fun ExpressiveHorizontalTabStrip(
                             contentDescription = stringResource(R.string.fab_new_tab),
                             tint = MaterialTheme.colorScheme.onSecondaryContainer
                         )
+                    }
+                }
+            }
+
+            if (onOpenDevTools != null) {
+                item {
+                    Surface(
+                        shape = rememberMorphingCornerShape(targetRadius = if (isDevToolsOpen) 14.dp else 20.dp),
+                        color = if (isDevToolsOpen) {
+                            MaterialTheme.colorScheme.primaryContainer
+                        } else {
+                            MaterialTheme.colorScheme.surfaceContainerHigh
+                        },
+                        border = if (isDevToolsOpen) {
+                            BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+                        } else {
+                            null
+                        },
+                        modifier = Modifier
+                            .minimumInteractiveComponentSize()
+                            .clickable(onClick = onOpenDevTools)
+                            .testTag("tab_strip_devtools_button")
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.size(40.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Code,
+                                contentDescription = stringResource(R.string.cd_open_developer_tools),
+                                tint = if (isDevToolsOpen) {
+                                    MaterialTheme.colorScheme.onPrimaryContainer
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
                     }
                 }
             }

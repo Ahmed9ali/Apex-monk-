@@ -474,4 +474,34 @@
     <string name="automation_vault_exhausted_generate_action">Generate %1$d &amp; Resume</string>
     <string name="automation_vault_exhausted_open_vault">Open Vault to Add Data</string>
     <string name="automation_field_only_pool_hint">Field target recorded — fills dynamically from Vault pool on replay</string>
+
+    <!-- Developer Tools -->
+    <string name="menu_developer_tools">Developer tools</string>
+    <string name="menu_developer_tools_subtitle">Console, Elements, Network &amp; Storage</string>
+    <string name="cd_open_developer_tools">Open Developer tools</string>
+    <string name="devtools_title">DevTools</string>
+    <string name="devtools_tab_console">Console</string>
+    <string name="devtools_tab_elements">Elements</string>
+    <string name="devtools_tab_network">Network</string>
+    <string name="devtools_tab_application">Application</string>
+    <string name="devtools_cd_inspect_element">Select element on page to inspect</string>
+    <string name="devtools_cd_refresh">Refresh inspection data</string>
+    <string name="devtools_cd_hard_reload">Hard reload active tab</string>
+    <string name="devtools_cd_toggle_dock">Switch DevTools dock layout</string>
+    <string name="devtools_cd_close">Close Developer tools</string>
+    <string name="devtools_cd_clear">Clear</string>
+    <string name="devtools_console_hint">Run JavaScript expression…</string>
+    <string name="devtools_console_run">Run</string>
+    <string name="devtools_console_empty">No console output yet. Logs, warnings, errors, and evaluated expressions will appear here.</string>
+    <string name="devtools_elements_search_hint">Filter by CSS selector, tag, id, or text…</string>
+    <string name="devtools_elements_empty">Open a webpage or tap Refresh to inspect the live DOM tree.</string>
+    <string name="devtools_elements_pick_hint">Tap any element on the webpage to inspect it</string>
+    <string name="devtools_network_search_hint">Filter requests by URL or type…</string>
+    <string name="devtools_network_empty">No network requests recorded on this tab yet. Reload or interact with the page.</string>
+    <string name="devtools_network_sync_timing">Sync Timing</string>
+    <string name="devtools_storage_empty">No entries found</string>
+    <string name="devtools_storage_add_title">Add Storage Entry</string>
+    <string name="devtools_storage_key_label">Key</string>
+    <string name="devtools_storage_value_label">Value</string>
+    <string name="devtools_home_notice">Open a webpage to inspect live DOM, Console logs, Network requests, and Site Storage.</string>
 </resources>

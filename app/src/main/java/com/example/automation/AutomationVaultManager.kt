@@ -701,7 +701,9 @@ class AutomationVaultManager(
                 val isPwd = category == AutomationVaultCategory.PASSWORD || step.isCredentialStep
                 val hasExplicitPoolBinding = step.useVaultPool || step.vaultCategory.isNotBlank() || !step.vaultEntryId.isNullOrBlank()
                 val isFieldOnlyCapable = step.actionType == AutomationActionType.INPUT || step.actionType == AutomationActionType.SELECT
-                if (!isPwd && rawVal.isBlank() && !hasExplicitPoolBinding && !isFieldOnlyCapable) {
+                if (!isPwd && rawVal.isBlank() && !hasExplicitPoolBinding &&
+                    (!isFieldOnlyCapable || (step.actionType == AutomationActionType.SELECT && category == AutomationVaultCategory.CUSTOM))
+                ) {
                     return@mapNotNull null
                 }
                 val cleanTarget = step.targetLabel
@@ -723,6 +725,9 @@ class AutomationVaultManager(
                         existing.label.equals(defaultLabel, ignoreCase = true)
                 }
                 val isFieldOnlyEmpty = rawVal.isEmpty() && isFieldOnlyCapable
+                val autoSelectFieldOnly = isFieldOnlyEmpty &&
+                    step.credentialReferenceId.isNullOrBlank() &&
+                    (category != AutomationVaultCategory.CUSTOM || hasExplicitPoolBinding)
                 RecordingVaultCandidate(
                     stepId = step.id,
                     stepOrder = step.order,
@@ -733,7 +738,7 @@ class AutomationVaultManager(
                     capturedValue = rawVal,
                     hasSecretCapture = isPwd && secretOverride.isNotEmpty(),
                     isSensitive = category.isSensitiveDefault,
-                    isSelected = !isPwd || secretOverride.isNotEmpty() || matchedExisting != null || (isFieldOnlyEmpty && step.credentialReferenceId.isNullOrBlank()),
+                    isSelected = !isPwd || secretOverride.isNotEmpty() || matchedExisting != null || autoSelectFieldOnly,
                     existingEntryId = matchedExisting?.entryId
                 )
             }

@@ -1076,6 +1076,16 @@ private fun AutomationRecordingContent(
                         style = MaterialTheme.typography.bodySmall,
                         color = statusContentColor.copy(alpha = 0.85f)
                     )
+                    if (session.targetUrl.startsWith("http", ignoreCase = true) && !isInAnotherTab) {
+                        Text(
+                            text = "Link: ${session.targetUrl}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = statusContentColor.copy(alpha = 0.72f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.testTag("recording_remembered_link")
+                        )
+                    }
                 }
             }
         }
